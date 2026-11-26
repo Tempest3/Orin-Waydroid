@@ -2,7 +2,7 @@
 
 GPU-accelerated Android with the Google Play Store on an **NVIDIA Jetson Orin Nano**, via
 [Waydroid](https://waydro.id). Android renders on the Orin GPU through Mesa (NVK on NVIDIA's `nvgpu` driver
-+ Zink), using the stock JetPack driver stack and no proprietary Android blobs.
+and Zink), using the stock JetPack driver stack and no proprietary Android blobs.
 
 | | |
 |---|---|
