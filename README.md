@@ -96,5 +96,5 @@ Copy `dist/` next to `install.sh` on the Jetson, or host it and use `--from <url
 
 ## License
 
-The scripts in this repository: TBD by the maintainer. `patches/mesa` are under Mesa's licenses (MIT),
+The scripts and docs in this repository: MIT (see LICENSE). `patches/mesa` are under Mesa's licenses (MIT),
 the kernel config and released kernel binaries under GPL-2.0 (sources: NVIDIA L4T R39.2 public sources).
