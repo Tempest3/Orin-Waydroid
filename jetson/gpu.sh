@@ -73,7 +73,7 @@ apply)
   W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
   tar -C "$W" -xf "$TAR"
   for f in $FILES; do [ -f "$W/lib64/$f" ] || die "Mesa tarball lacks lib64/$f"; install -D -m644 "$W/lib64/$f" "$OV/$f"; done
-  ok "Mesa ($(cat "$W/MESA_VERSION" 2>/dev/null || echo ?)) installed into $OV"
+  ok "Mesa ($(head -1 "$W/MESA_VERSION" 2>/dev/null || echo ?), $(sed -n 2p "$W/MESA_VERSION" 2>/dev/null)) installed into $OV"
   [ -f "$CFG.pre-orin-waydroid" ] || cp -a "$CFG" "$CFG.pre-orin-waydroid"
   node=$(render_node); cfg_edit apply "$node"; ok "waydroid.cfg: drm_device=$node + GPU properties"
   waydroid upgrade --offline >/dev/null 2>&1 || waydroid upgrade --offline

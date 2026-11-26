@@ -46,10 +46,13 @@ ok "NDK r29, libdrm 2.4.133, libelf 0.8.13"
 if ! rustup target list --installed 2>/dev/null | grep -q aarch64-linux-android; then
   if ! command -v rustup >/dev/null; then
     say "Installing rustup into $TOOLS"
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+    # (a distro Rust may also be installed; ours lives in $TOOLS and wins via PATH)
+    curl -fsSL https://sh.rustup.rs | RUSTUP_INIT_SKIP_PATH_CHECK=yes sh -s -- -y --no-modify-path \
+      --profile minimal --component rustfmt
   fi
   rustup target add aarch64-linux-android
 fi
+rustup component list --installed 2>/dev/null | grep -q rustfmt || rustup component add rustfmt  # bindgen formats with it
 command -v bindgen >/dev/null || cargo install --locked bindgen-cli
 command -v cbindgen >/dev/null || cargo install --locked cbindgen
 ok "rust: $(rustc --version)"
