@@ -1,0 +1,101 @@
+From 089fb8ff34e2a6f8f6c6ff44d0ab2f34b1ec4830 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 01:30:45 -0500
+Subject: [PATCH] nvk: widen unaligned flush/invalidate ranges instead of
+ asserting
+
+Unity (Android) calls vkFlushMappedMemoryRanges with sizes that are not
+multiples of nonCoherentAtomSize. That is invalid usage, but common on
+Android where host-visible memory is almost always coherent, and with
+asserts enabled it aborts the app. Round the range out to whole atoms,
+clamped to the (page-sized) nvkmd mem.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_device_memory.c | 42 ++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+index ac565be3601..e0760ea48c4 100644
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -426,6 +426,26 @@ nvk_UnmapMemory2KHR(VkDevice device,
+    }
+ }
+ 
++/* Apps (e.g. Unity on Android, where memory is nearly always HOST_COHERENT)
++ * often pass ranges that aren't nonCoherentAtomSize-aligned.  Rather than
++ * asserting, widen the range to whole atoms; nvkmd mems are page-sized so the
++ * widened range stays inside the mapping.
++ */
++static void
++nvk_mapped_range_to_atoms(const struct nvk_device_memory *mem,
++                          const VkMappedMemoryRange *range,
++                          uint32_t nc_atom_size_B,
++                          uint64_t *offset_out, uint64_t *size_out)
++{
++   const VkDeviceSize size =
++      vk_device_memory_range(&mem->vk, range->offset, range->size);
++   const uint64_t start = ROUND_DOWN_TO(range->offset, nc_atom_size_B);
++   uint64_t end = ALIGN_POT(range->offset + size, nc_atom_size_B);
++   end = MIN2(end, ALIGN_POT(mem->mem->size_B, nc_atom_size_B));
++   *offset_out = start;
++   *size_out = end - start;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_FlushMappedMemoryRanges(VkDevice device,
+                             uint32_t memoryRangeCount,
+@@ -444,7 +464,6 @@ nvk_FlushMappedMemoryRanges(VkDevice device,
+        *    "offset must be a multiple of
+        *    VkPhysicalDeviceLimits::nonCoherentAtomSize"
+        */
+-      assert(range->offset % nc_atom_size_B == 0);
+ 
+       /* From the Vulkan 1.4.305 spec:
+        *
+@@ -461,13 +480,9 @@ nvk_FlushMappedMemoryRanges(VkDevice device,
+        * Ensure that either the size is aligned or the range is the full
+        * object.
+        */
+-      VkDeviceSize size =
+-         vk_device_memory_range(&mem->vk, range->offset, range->size);
+-      assert(size % nc_atom_size_B == 0 ||
+-             (range->offset + size) == mem->vk.size);
+-      size = ALIGN_POT(size, mem->mem->dev->pdev->dev_info.nc_atom_size_B);
+-
+-      nvkmd_mem_sync_client_map_to_gpu(mem->mem, range->offset, size);
++      uint64_t offset_B, size_B;
++      nvk_mapped_range_to_atoms(mem, range, nc_atom_size_B, &offset_B, &size_B);
++      nvkmd_mem_sync_client_map_to_gpu(mem->mem, offset_B, size_B);
+    }
+ 
+    return VK_SUCCESS;
+@@ -491,7 +506,6 @@ nvk_InvalidateMappedMemoryRanges(VkDevice device,
+        *    "offset must be a multiple of
+        *    VkPhysicalDeviceLimits::nonCoherentAtomSize"
+        */
+-      assert(range->offset % nc_atom_size_B == 0);
+ 
+       /* From the Vulkan 1.4.305 spec:
+        *
+@@ -508,13 +522,9 @@ nvk_InvalidateMappedMemoryRanges(VkDevice device,
+        * Ensure that either the size is aligned or the range is the full
+        * object.
+        */
+-      VkDeviceSize size =
+-         vk_device_memory_range(&mem->vk, range->offset, range->size);
+-      assert(size % nc_atom_size_B == 0 ||
+-             (range->offset + size) == mem->vk.size);
+-      size = ALIGN_POT(size, mem->mem->dev->pdev->dev_info.nc_atom_size_B);
+-
+-      nvkmd_mem_sync_client_map_from_gpu(mem->mem, range->offset, size);
++      uint64_t offset_B, size_B;
++      nvk_mapped_range_to_atoms(mem, range, nc_atom_size_B, &offset_B, &size_B);
++      nvkmd_mem_sync_client_map_from_gpu(mem->mem, offset_B, size_B);
+    }
+ 
+    return VK_SUCCESS;
+-- 
+2.56.0
+

@@ -1,0 +1,47 @@
+From cf5cedfbf6a2bd6b943dd6c37d408dde71cc7e26 Mon Sep 17 00:00:00 2001
+From: Russell Greene <russellgreene8@gmail.com>
+Date: Fri, 4 Apr 2025 06:43:26 +0000
+Subject: [PATCH 05/16] nvrm/nvgpu: don't allocate memory as coherent
+
+helps performance quite a bit
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c | 2 --
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c  | 7 ++++++-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index 5d9a57bd21b..68ee368c728 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -223,8 +223,6 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    // if (domains == nvgpu_WS_BO_GART)
+    //    va_flags |= NVKMD_VA_GART;
+ 
+-   flags |= NVKMD_MEM_COHERENT; // we allocate everything as coherent
+-
+    return create_mem_or_close_bo(dev, log_obj, flags, handle, size_B,
+                                  va_flags, pte_kind, va_align_B,
+                                  mem_out);
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index fba8a0bddf8..023f7c7186d 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -270,9 +270,14 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    }
+ 
+    // mmap(NULL, range_B, get_fd_args.fd, )
++   
++   
++   __u32 flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
++   if (mem->base.flags & NVKMD_MEM_COHERENT)
++      flags |= NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT;
+ 
+    struct nvgpu_as_map_buffer_ex_args map_buffer_args = {
+-      .flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT, // |*/ NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE, // xxx,
++      .flags = flags,
+       .compr_kind = NV_KIND_INVALID,
+       .incompr_kind = va->base.pte_kind,
+       .dmabuf_fd = get_fd_args.fd,
+-- 
+2.56.0
+

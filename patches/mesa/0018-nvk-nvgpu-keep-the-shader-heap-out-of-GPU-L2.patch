@@ -1,0 +1,79 @@
+From ab5c621fe797b0877b3c09eccef294563c152f58 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 01:22:56 -0500
+Subject: [PATCH 18/20] nvk/nvgpu: keep the shader heap out of GPU L2
+
+On Tegra nvgpu, sysmem cached in the GPU L2 is not snooped and nvgpu does
+not invalidate L2 on submit, so flushing CPU caches after a CPU shader
+upload is not enough: the GPU can still serve a stale L2 copy of the
+uploaded lines (e.g. pulled in earlier by instruction prefetch of a
+neighbouring shader). Result: SM ILLEGAL_INSTR_ENCODING (warp ESR 0x9)
+at offset 0 of a freshly uploaded shader, then a ctxsw timeout.
+
+Add NVKMD_MEM_GPU_UNCACHED as a hint, set it for the shader heap and
+map such memory without NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE in the
+nvgpu backend. Other backends ignore it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_device.c                 | 7 ++++++-
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c | 4 ++++
+ src/nouveau/vulkan/nvkmd/nvkmd.h                | 8 ++++++++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 297c82eac99..d60ab88b1d8 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -325,8 +325,13 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+       enum nvkmd_mem_map_flags shader_map_flags = 0;
+       if (pdev->info.bar_size_B >= pdev->info.vram_size_B)
+          shader_map_flags = NVKMD_MEM_MAP_WR;
++      /* GPU_UNCACHED: shader code is CPU-written; on nvgpu a stale L2 copy of
++       * reused/neighbouring heap lines gives SM ILLEGAL_INSTR_ENCODING faults.
++       * Instruction fetch still goes through the SM instruction caches.
++       */
+       result = nvk_heap_init(dev, &dev->shader_heap,
+-                             NVKMD_MEM_LOCAL, shader_map_flags,
++                             NVKMD_MEM_LOCAL | NVKMD_MEM_GPU_UNCACHED,
++                             shader_map_flags,
+                              2048 /* overalloc */,
+                              pdev->info.cls_eng3d < VOLTA_A);
+       if (result != VK_SUCCESS)
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index cae864cdc81..d4c04499cba 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -269,6 +269,10 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    
+    
+    __u32 flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
++   /* GPU L2 does not snoop CPU writes to sysmem and nvgpu does not invalidate
++    * L2 on submit, so CPU-written data must bypass L2 (see NVKMD_MEM_GPU_UNCACHED). */
++   if (mem->base.flags & NVKMD_MEM_GPU_UNCACHED)
++      flags &= ~NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
+    if (mem->base.flags & NVKMD_MEM_COHERENT)
+       flags |= NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index ee3e21a933a..6527799f113 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -55,6 +55,14 @@ enum nvkmd_mem_flags {
+ 
+    /** This memory object has coherent CPU maps */
+    NVKMD_MEM_COHERENT   = 1 << 5,
++
++   /** Hint: don't cache this memory in the GPU L2.
++    *
++    * For CPU-written data the GPU must never see stale (e.g. shader code on
++    * Tegra nvgpu, where sysmem in L2 is not snooped and a CPU cache flush
++    * does not evict L2 lines).  Backends that don't need it ignore it.
++    */
++   NVKMD_MEM_GPU_UNCACHED = 1 << 6,
+ };
+ 
+ #define NVKMD_MEM_PLACEMENT_FLAGS \
+-- 
+2.56.0
+

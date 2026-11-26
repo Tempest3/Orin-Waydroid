@@ -1,0 +1,213 @@
+From 9779123196c7b9750ddee9cb47eb28982a325bbe Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 20:13:29 -0500
+Subject: [PATCH 15/16] nvkmd/nvgpu: fix fence waits and GPU L2 visibility
+
+- CPU waits: binary syncs are waited with wait_value 0, so the
+  'cur >= wait_value' early-out always passed and vkQueueWaitIdle /
+  fences returned before the GPU finished. Compare raw 32-bit syncpoint
+  values (wait_value - local_offset), wrap-safe.
+- Waiting must not reset the sync payload.
+- GPU waits passed the logical value as the raw syncpoint threshold
+  (0 for binary syncs: never waited). Use wait_value - local_offset and
+  skip never-submitted syncs instead of asserting.
+- nvgpu's job post-fence is just WFI + syncpoint incr; dirty GPU L2
+  lines were not written back, so CPU readers saw stale data after the
+  fence. Append WFI + L2 FLUSH_DIRTY + SYS_MEMBAR to every submission
+  that signals or syncs.
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  |  2 +
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 69 +++++++++++++++++--
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c     | 27 +++++---
+ 3 files changed, 83 insertions(+), 15 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index 2ca431cdefd..d4fb01d18b5 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -126,6 +126,8 @@ struct nvkmd_nvgpu_exec_ctx {
+    // struct nvkmd_mem *userD;
+    struct nvkmd_mem *gp_fifo;
+    struct nvkmd_mem *zcull_buf;
++   struct nvkmd_mem *flush_push; /* WFI + L2 flush + sysmembar, see ctx.c */
++   uint32_t flush_push_size_B;
+ 
+    int push_count;
+    bool is_fence_filled;
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index 5fc93d9f7e4..c596ff16451 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "cla16f.h"
++#include "clc56f.h"
+ #include "nvk_device.h"
+ #include "nvkmd_nvgpu.h"
+ 
+@@ -52,6 +53,35 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+    if (err != VK_SUCCESS)
+    	return err;
+ 
++   /* nvgpu's job post-fence is only "WFI + syncpoint increment": unlike the
++    * nouveau kernel fence, nothing writes dirty GPU L2 lines back to memory,
++    * so CPU readers (and other non-GPU clients) could see stale data after
++    * the fence signalled.  Keep a tiny push buffer that we append to every
++    * submission that signals: WFI, L2 FLUSH_DIRTY, then a SYS_MEMBAR.
++    */
++   err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj, 0x1000, 0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR, &ctx->flush_push);
++   if (err != VK_SUCCESS)
++      return err;
++   {
++#define HOST_INC(mthd, count) ((1u << 29) | ((uint32_t)(count) << 16) | ((mthd) >> 2))
++      uint32_t *p = ctx->flush_push->map;
++      uint32_t n = 0;
++      p[n++] = HOST_INC(NVC56F_WFI, 1);
++      p[n++] = NVC56F_WFI_SCOPE_ALL;
++      p[n++] = HOST_INC(NVC56F_MEM_OP_A, 4);
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = NVC56F_MEM_OP_D_OPERATION_L2_FLUSH_DIRTY << 27;
++      p[n++] = HOST_INC(NVC56F_MEM_OP_A, 4);
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = NVC56F_MEM_OP_C_MEMBAR_TYPE_SYS_MEMBAR;
++      p[n++] = NVC56F_MEM_OP_D_OPERATION_MEMBAR << 27;
++      ctx->flush_push_size_B = n * 4;
++#undef HOST_INC
++   }
++
+    struct nvgpu_gpu_open_channel_args open_args = {
+       .in.runlist_id = 0 // what nvidia passes
+    };
+@@ -234,6 +264,15 @@ nvkmd_nvgpu_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+ 
+ 
+    for (uint32_t i = 0; i < wait_count; i++) {
++      struct nvkmd_nvgpu_sync *sync = vk_sync_as_nvgpu_sync(waits[i].sync);
++      assert(sync != NULL);
++
++      /* Never submitted to a syncpoint (e.g. CPU-signalled): nothing to
++       * wait for on the GPU.
++       */
++      if (!sync->initialized)
++         continue;
++
+       if (ctx->is_fence_filled) {
+          VkResult res = nvkmd_nvgpu_exec_ctx_flush(_ctx, log_obj);
+          if (res != VK_SUCCESS) { return res; }
+@@ -241,13 +280,12 @@ nvkmd_nvgpu_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+       assert(!ctx->is_fence_filled);
+       ctx->is_fence_filled = true;
+ 
+-      struct nvkmd_nvgpu_sync *sync = vk_sync_as_nvgpu_sync(waits[i].sync);
+-      assert(sync != NULL);
+-      assert(sync->initialized);
+-
++      /* The fence takes a raw syncpoint threshold; the logical value is
++       * offset by local_offset (binary syncs wait with wait_value 0).
++       */
+       ctx->fence = (struct nvgpu_fence) {
+          .id = sync->syncpoint_id,
+-         .value = waits[i].wait_value,
++         .value = (uint32_t)(waits[i].wait_value - sync->local_offset),
+       };
+ 
+       // VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
+@@ -379,6 +417,17 @@ nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++nvkmd_nvgpu_exec_ctx_push_flush(struct nvkmd_nvgpu_exec_ctx *ctx,
++                                struct vk_object_base *log_obj)
++{
++   const struct nvkmd_ctx_exec flush = {
++      .addr = ctx->flush_push->va->addr,
++      .size_B = ctx->flush_push_size_B,
++   };
++   return nvkmd_nvgpu_exec_ctx_exec(&ctx->base, log_obj, 1, &flush);
++}
++
+ static VkResult
+ nvkmd_nvgpu_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+                               struct vk_object_base *log_obj,
+@@ -388,6 +437,11 @@ nvkmd_nvgpu_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+    struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+ 
+    struct nvgpu_fence fence;
++   if (signal_count != 0) {
++      VkResult res = nvkmd_nvgpu_exec_ctx_push_flush(ctx, log_obj);
++      if (res != VK_SUCCESS)
++         return res;
++   }
+    VkResult res = nvkmd_nvgpu_exec_ctx_flush_impl(&ctx->base, log_obj, signal_count == 0 ? NULL : &fence);
+    if (res != VK_SUCCESS) { return res; }
+ 
+@@ -418,7 +472,10 @@ nvkmd_nvgpu_exec_ctx_sync(struct nvkmd_ctx *_ctx,
+    struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_ctx->dev->pdev);
+ 
+    struct nvgpu_fence fence;
+-   VkResult res = nvkmd_nvgpu_exec_ctx_flush_impl(&ctx->base, log_obj, &fence);
++   VkResult res = nvkmd_nvgpu_exec_ctx_push_flush(ctx, log_obj);
++   if (res != VK_SUCCESS)
++      return res;
++   res = nvkmd_nvgpu_exec_ctx_flush_impl(&ctx->base, log_obj, &fence);
+    if (res != VK_SUCCESS) { return res; }
+ 
+    struct drm_tegra_syncpoint_wait wait_arg = {
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+index 2f2466019d2..631dbef2c19 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+@@ -133,27 +133,36 @@ nvkmd_nvgpu_sync_wait_many(struct vk_device *device,
+       // }
+ 
+       uint64_t cur_val;
+-      nvkmd_nvgpu_sync_get_value(device, waits[i].sync, &cur_val);
+-
+-      // printf("(vk=%p nv=%d) currently am %lu, waiting until %lu (off=%ld)\n", waits[i].sync, sobj->syncpoint_id, cur_val - sobj->local_offset, waits[i].wait_value - sobj->local_offset, sobj->local_offset);
+-
+-      if (cur_val >= waits[i].wait_value) {
+-         continue; // already finished??
+-      }
++      VkResult res = nvkmd_nvgpu_sync_get_value(device, waits[i].sync, &cur_val);
++      if (res != VK_SUCCESS)
++         return res;
++
++      /* Compare raw 32-bit syncpoint values, wrap-safe.  Binary syncs are
++       * waited with wait_value == 0, so comparing logical values
++       * (cur_val >= wait_value) was always true and binary waits (fences,
++       * vkQueueWaitIdle) returned before the GPU finished.  The raw target
++       * wait_value - local_offset is right for both binary (signal_value 0)
++       * and timeline syncs.
++       */
++      const uint32_t raw_cur = (uint32_t)(cur_val - sobj->local_offset);
++      const uint32_t raw_target = (uint32_t)(waits[i].wait_value - sobj->local_offset);
++      if ((int32_t)(raw_cur - raw_target) >= 0)
++         continue; // already finished
+ 
+       struct drm_tegra_syncpoint_wait wait_arg = {
+          .timeout_ns = abs_timeout_ns,
+          .id = sobj->syncpoint_id,
+-         .threshold = waits[i].wait_value - sobj->local_offset,
++         .threshold = raw_target,
+       };
+       if (nvgpu_ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait_arg) == -1) {
+          printf("wait: failed to DRM_IOCTL_TEGRA_SYNCPOINT_WAIT: %d\n", errno);
+          return VK_ERROR_UNKNOWN;
+       }
+ 
+-      sobj->initialized = false; // reset
++      /* Waiting does not consume the payload; only reset() does. */
+    }
+ 
++
+    return VK_SUCCESS;
+ }
+ 
+-- 
+2.56.0
+

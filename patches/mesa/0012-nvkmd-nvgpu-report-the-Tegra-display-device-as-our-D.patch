@@ -1,0 +1,99 @@
+From a282f03b81ded7a3ce950584dbf4d1da90dde118 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:53:45 -0500
+Subject: [PATCH 12/16] nvkmd/nvgpu: report the Tegra display device as our DRM
+ nodes
+
+Compositors on L4T render and import through the nvidia-drm display
+device, not the host1x tegra node nvgpu uses. With mismatched nodes the
+Wayland WSI assumes a different GPU and PRIME-blits into LINEAR buffers,
+which NVIDIA's EGL only accepts as external-only textures (mutter then
+fails to bind them). The GPU and display share memory on the SoC, so
+report the display device's primary/render nodes.
+---
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     | 62 +++++++++++++++++--
+ 1 file changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index e7d120b43c7..9f4693afee7 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -40,6 +40,51 @@ drm_device_is_tegra(const char *path)
+    return is_nouveau;
+ }
+ 
++/* On Tegra, the GPU (nvgpu, driven through the host1x "tegra" DRM node) and
++ * the display engine (nvidia-drm, a separate platform DRM device) are one SoC
++ * sharing system memory.  Compositors render and import through the
++ * nvidia-drm node, so report that device's nodes as ours; otherwise WSI
++ * treats the compositor as a different GPU and falls back to LINEAR PRIME
++ * blits, which NVIDIA's EGL only accepts as external-only textures.
++ *
++ * Returns true and fills primary/render dev_t if a display device is found.
++ */
++static bool
++find_tegra_display_drm_device(dev_t *primary_dev, dev_t *render_dev)
++{
++   drmDevicePtr devices[64];
++   int n = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
++   bool found = false;
++
++   for (int i = 0; i < n && !found; i++) {
++      drmDevicePtr d = devices[i];
++      if (d->bustype != DRM_BUS_PLATFORM || !d->deviceinfo.platform)
++         continue;
++
++      char **compat = d->deviceinfo.platform->compatible;
++      bool is_display = false;
++      for (int j = 0; compat && compat[j]; j++) {
++         if (!strncmp(compat[j], "nvidia,", 7) && strstr(compat[j], "-display"))
++            is_display = true;
++      }
++      if (!is_display)
++         continue;
++
++      struct stat st;
++      if ((d->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++          !stat(d->nodes[DRM_NODE_PRIMARY], &st))
++         *primary_dev = st.st_rdev;
++      if ((d->available_nodes & (1 << DRM_NODE_RENDER)) &&
++          !stat(d->nodes[DRM_NODE_RENDER], &st))
++         *render_dev = st.st_rdev;
++      found = *primary_dev != 0 || *render_dev != 0;
++   }
++
++   if (n > 0)
++      drmFreeDevices(devices, n);
++   return found;
++}
++
+ static uint8_t
+ max_warps_per_mp_for_sm(uint8_t sm)
+ {
+@@ -267,12 +312,17 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+    assert(os_page_size <= UINT32_MAX);
+    pdev->base.bind_align_B = os_page_size;
+ 
+-//    pdev->base.drm.render_dev = render_dev;
+-
+-   /* DRM primary is optional */
+-   if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+-       !stat(drm_device->nodes[DRM_NODE_PRIMARY], &st))
+-      pdev->base.drm.primary_dev = st.st_rdev;
++   /* Report the SoC display device's DRM nodes when present (see
++    * find_tegra_display_drm_device); NVK still uses render_fd (the tegra
++    * host1x node) internally for syncpoints.
++    */
++   if (!find_tegra_display_drm_device(&pdev->base.drm.primary_dev,
++                                      &pdev->base.drm.render_dev)) {
++      /* DRM primary is optional */
++      if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++          !stat(drm_device->nodes[DRM_NODE_PRIMARY], &st))
++         pdev->base.drm.primary_dev = st.st_rdev;
++   }
+ 
+    pdev->primary_fd = -1;
+    pdev->render_fd = open(drm_device->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+-- 
+2.56.0
+

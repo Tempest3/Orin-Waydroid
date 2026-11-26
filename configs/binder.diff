@@ -1,0 +1,27 @@
+--- configs/stock-6.8.12-1021-tegra.config	2026-11-25 17:20:25.907280346 -0500
++++ /run/media/tempest3/android_drive/main/src/l4t-r39.2/build/kernel/.config	2026-11-25 17:35:09.879455676 -0500
+@@ -130,7 +130,7 @@
+ # CONFIG_TASK_DELAY_ACCT is not set
+ CONFIG_TASK_XACCT=y
+ CONFIG_TASK_IO_ACCOUNTING=y
+-# CONFIG_PSI is not set
++CONFIG_PSI=y
+ # end of CPU/Task time and stats accounting
+ 
+ CONFIG_CPU_ISOLATION=y
+@@ -9882,7 +9882,7 @@
+ #
+ # Android
+ #
+-# CONFIG_ANDROID_BINDER_IPC is not set
++CONFIG_ANDROID_BINDER_IPC=y
+ # end of Android
+ 
+ # CONFIG_LIBNVDIMM is not set
+@@ -11238,3 +11238,6 @@
+ #
+ # end of Rust hacking
+ # end of Kernel hacking
++CONFIG_ANDROID_BINDERFS=y
++CONFIG_ANDROID_BINDER_DEVICES=""
++# CONFIG_PSI_DEFAULT_DISABLED is not set

@@ -1,0 +1,38 @@
+From 97bbe39851a536a4c8f35e3fe042b2cde658c74e Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 23:48:33 -0500
+Subject: [PATCH] gbm/dri: use the DRI3 screen type for zink on Android
+
+Kopper is not built when the Android platform is enabled (the DRI
+frontend links kopper_stubs.c, whose kopper_init_screen() returns NULL),
+so gbm_create_device() always failed for zink on Android. That breaks
+minigbm's gbm_mesa gralloc backend (e.g. Waydroid) on zink-only GPUs.
+
+Use DRI_SCREEN_DRI3 there instead: zink is then created from the DRM fd
+through the pipe-loader, the same path Android EGL already uses.
+---
+ src/gbm/backends/dri/gbm_dri.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/gbm/backends/dri/gbm_dri.c b/src/gbm/backends/dri/gbm_dri.c
+index b031d844878..bf2fd9333a2 100644
+--- a/src/gbm/backends/dri/gbm_dri.c
++++ b/src/gbm/backends/dri/gbm_dri.c
+@@ -243,7 +243,14 @@ dri_screen_create_for_driver(struct gbm_dri_device *dri, char *driver_name, bool
+    enum dri_screen_type type = DRI_SCREEN_SWRAST;
+    if (!swrast) {
+       if (!strcmp(driver_name, "zink"))
++#ifdef HAVE_ANDROID_PLATFORM
++         /* Kopper is not built for Android (kopper_stubs.c returns no screen);
++          * zink works through the regular DRM fd path there, like Android EGL.
++          */
++         type = DRI_SCREEN_DRI3;
++#else
+          type = DRI_SCREEN_KOPPER;
++#endif
+       else if (!strcmp(driver_name, "kms_swrast"))
+          type = DRI_SCREEN_KMS_SWRAST;
+       else
+-- 
+2.56.0
+

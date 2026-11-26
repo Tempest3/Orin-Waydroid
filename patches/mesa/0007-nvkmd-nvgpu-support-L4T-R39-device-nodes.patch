@@ -1,0 +1,65 @@
+From 1e34241de031a2d8e7438ca1c1aa284dea8ccc9e Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:12:58 -0500
+Subject: [PATCH 07/16] nvkmd/nvgpu: support L4T R39 device nodes
+
+Fall back to /dev/nvhost-ctrl-gpu when /dev/nvgpu/igpu0/ctrl does not
+exist, and open /dev/nvmap read-only when it is not writable (R39.2
+ships it as 0440 root:video). Fail cleanly instead of continuing with
+fd -1.
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c  | 9 +++++++++
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c | 8 ++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+index 8a9ae1eee36..b47cb6acd07 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+@@ -7,6 +7,7 @@
+ 
+ #include "vk_log.h"
+ 
++#include <errno.h>
+ #include <fcntl.h>
+ #include <xf86drm.h>
+ #include "drm-uapi/nvgpu-as.h"
+@@ -36,7 +37,15 @@ nvkmd_nvgpu_create_dev(struct nvkmd_pdev *_pdev,
+    dev->base.va_end = NVKMD_NVGPU_REPLAY_HEAP_END;
+ 
+    dev->ctrl_fd = pdev->ctrl_fd;
++   /* L4T R39.x ships /dev/nvmap as 0440 root:video; ioctls work on a read-only fd. */
+    dev->nvmap_fd = open("/dev/nvmap", O_RDWR | O_CLOEXEC);
++   if (dev->nvmap_fd < 0 && errno == EACCES)
++      dev->nvmap_fd = open("/dev/nvmap", O_RDONLY | O_CLOEXEC);
++   if (dev->nvmap_fd < 0) {
++      FREE(dev);
++      return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                       "failed to open /dev/nvmap: %m");
++   }
+    // dev->modeset_fd = open("/dev/nvidia-modeset", O_RDWR | O_CLOEXEC);
+    // dev->host1x_fd = open("/dev/host1x-fence");
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index 62b2438da53..76678d0f76c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -203,7 +203,15 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
++   /* Newer L4T (e.g. R39.x) only exposes the legacy nvhost-*-gpu node names. */
+    pdev->ctrl_fd = open("/dev/nvgpu/igpu0/ctrl", O_RDWR | O_CLOEXEC);
++   if (pdev->ctrl_fd < 0)
++      pdev->ctrl_fd = open("/dev/nvhost-ctrl-gpu", O_RDWR | O_CLOEXEC);
++   if (pdev->ctrl_fd < 0) {
++      FREE(pdev);
++      return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                       "failed to open nvgpu ctrl node: %m");
++   }
+ 
+    struct nvgpu_gpu_characteristics chars  = {};
+    struct nvgpu_gpu_get_characteristics chars_get = {
+-- 
+2.56.0
+

@@ -1,0 +1,144 @@
+From e3d87b46a5ab4757398b13a24929cd4e9c147d1e Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 01:22:56 -0500
+Subject: [PATCH 20/20] nak: make NAK_DEBUG usable on Android
+
+Read NAK_DEBUG via os_get_option (so debug.mesa.nak.debug works),
+add NAK_DEBUG_PROC=<cmdline substring> to limit it to one process,
+an "asm" flag that prints only the final shader + encoding, and on
+Android forward stderr to logcat (tag NAK).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/compiler/nak/api.rs | 70 ++++++++++++++++++++++++++++++---
+ 1 file changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 93aa7713a26..2a7a88dcace 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -12,7 +12,6 @@ use compiler::bindings::*;
+ use nak_bindings::*;
+ 
+ use std::cmp::max;
+-use std::env;
+ use std::ffi::{CStr, CString};
+ use std::fmt::Write;
+ use std::os::raw::c_void;
+@@ -28,6 +27,7 @@ enum DebugFlags {
+     Annotate,
+     NoUgpr,
+     Cycles,
++    Asm,
+ }
+ 
+ pub struct Debug {
+@@ -36,13 +36,24 @@ pub struct Debug {
+ 
+ impl Debug {
+     fn new() -> Debug {
+-        let debug_var = "NAK_DEBUG";
+-        let debug_str = match env::var(debug_var) {
+-            Ok(s) => s,
+-            Err(_) => {
++        // os_get_option: env var, or on Android the debug.mesa.nak.debug property.
++        let debug_str = match get_option(c"NAK_DEBUG") {
++            Some(s) => s,
++            None => {
+                 return Debug { flags: 0 };
+             }
+         };
++        // NAK_DEBUG_PROC=<substring of /proc/self/cmdline>: only debug that process.
++        if let Some(want) = get_option(c"NAK_DEBUG_PROC") {
++            let cmd = std::fs::read("/proc/self/cmdline").unwrap_or_default();
++            let cmd = String::from_utf8_lossy(&cmd);
++            let cmd = cmd.split('\0').next().unwrap_or("");
++            if !cmd.contains(want.as_str()) {
++                return Debug { flags: 0 };
++            }
++        }
++        #[cfg(target_os = "android")]
++        stderr_to_logcat();
+ 
+         let mut flags = 0;
+         for flag in debug_str.split(',') {
+@@ -54,6 +65,7 @@ impl Debug {
+                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
+                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
++                "asm" => flags |= 1 << DebugFlags::Asm as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -91,6 +103,48 @@ pub trait GetDebugFlags {
+     fn cycles(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
+     }
++
++    /// Final shader only (IR after all passes + encoding), much less output than print.
++    fn asm(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::Asm as u8) != 0
++    }
++}
++
++unsafe extern "C" {
++    fn os_get_option(name: *const std::os::raw::c_char) -> *const std::os::raw::c_char;
++}
++
++fn get_option(name: &CStr) -> Option<String> {
++    let v = unsafe { os_get_option(name.as_ptr()) };
++    if v.is_null() {
++        None
++    } else {
++        Some(unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned())
++    }
++}
++
++/// Android app processes have stderr on /dev/null: forward it, line by line, to logcat (tag NAK).
++#[cfg(target_os = "android")]
++fn stderr_to_logcat() {
++    use std::io::BufRead;
++    use std::os::fd::FromRawFd;
++    unsafe extern "C" {
++        fn pipe(fds: *mut i32) -> i32;
++        fn dup2(old: i32, new: i32) -> i32;
++        fn __android_log_write(prio: i32, tag: *const std::os::raw::c_char,
++                               text: *const std::os::raw::c_char) -> i32;
++    }
++    let mut fds = [0i32; 2];
++    if unsafe { pipe(fds.as_mut_ptr()) } != 0 || unsafe { dup2(fds[1], 2) } < 0 {
++        return;
++    }
++    let rd = unsafe { std::fs::File::from_raw_fd(fds[0]) };
++    let _ = std::thread::Builder::new().name("nak-log".into()).spawn(move || {
++        for line in std::io::BufReader::new(rd).lines().map_while(Result::ok) {
++            let c = CString::new(line.replace('\0', " ")).unwrap();
++            unsafe { __android_log_write(4 /* INFO */, c"NAK".as_ptr(), c.as_ptr()) };
++        }
++    });
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -417,7 +471,7 @@ impl ShaderBin {
+             hdr: sph::encode_header(sm, info, fs_key),
+         };
+ 
+-        if DEBUG.print() {
++        if DEBUG.print() || DEBUG.asm() {
+             let stage_name = unsafe {
+                 let c_name = _mesa_shader_stage_to_string(c_info.stage as u32);
+                 CStr::from_ptr(c_name).to_str().expect("Invalid UTF-8")
+@@ -554,6 +608,10 @@ fn nak_compile_shader_internal(
+ 
+     s.gather_info();
+ 
++    if DEBUG.asm() {
++        eprintln!("NAK final shader (sm {}):\n{}", nak.sm, &s);
++    }
++
+     let mut asm = String::new();
+     if dump_asm {
+         write!(asm, "{}", s).expect("Failed to dump assembly");
+-- 
+2.56.0
+

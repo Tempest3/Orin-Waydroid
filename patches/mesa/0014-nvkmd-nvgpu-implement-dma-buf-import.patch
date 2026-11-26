@@ -1,0 +1,272 @@
+From 1ebf4905b4099eb89cdf3ccdf5c454a84bde2b14 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 20:13:29 -0500
+Subject: [PATCH 14/16] nvkmd/nvgpu: implement dma-buf import
+
+nvgpu's AS MAP_BUFFER_EX takes a dma-buf fd directly, so an imported
+mem keeps its own dup of the fd and uses it wherever nvmap-allocated
+memory would call NVMAP_IOC_GET_FD (GPU bind, CPU map, export). Works
+for any exporter, not just nvmap. Imports are reported LOCAL|COHERENT|
+CAN_MAP|SHARED: Tegra has only sysmem and the Orin GPU is I/O-coherent.
+
+Also free the nvkmd_nvgpu_mem struct in mem_free (it leaked).
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  |   6 +-
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c      | 108 +++++++++++-------
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c       |  15 +--
+ 3 files changed, 79 insertions(+), 50 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index e9bca0c3571..2ca431cdefd 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -69,10 +69,14 @@ VkResult nvkmd_nvgpu_create_dev(struct nvkmd_pdev *pdev,
+ 
+ struct nvkmd_nvgpu_mem {
+    struct nvkmd_mem base;
+-   uint32_t nvmap_handle;
++   uint32_t nvmap_handle; /* 0 for imported dma-bufs */
++   int dmabuf_fd;         /* imported dma-buf (owned), or -1 */
+ };
+ NVKMD_DECL_SUBCLASS(mem, nvgpu);
+ 
++/* Returns a new dma-buf fd for mem (caller closes), or -1 with errno set. */
++int nvkmd_nvgpu_mem_get_dmabuf_fd(struct nvkmd_nvgpu_mem *mem);
++
+ VkResult nvkmd_nvgpu_alloc_mem(struct nvkmd_dev *dev,
+                                  struct vk_object_base *log_obj,
+                                  uint64_t size_B, uint64_t align_B,
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index 0679fec164a..d9c2dc6546b 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -15,6 +15,8 @@
+ #include "vulkan/vulkan_core.h"
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #define NVMAP_HEAP_IOVMM   (1ul<<30)
+ 
+@@ -58,7 +60,8 @@ static VkResult
+ create_mem_or_close_bo(struct nvkmd_nvgpu_dev *dev,
+                        struct vk_object_base *log_obj,
+                        enum nvkmd_mem_flags mem_flags,
+-                       uint32_t nvmap_handle, uint64_t size_B,
++                       uint32_t nvmap_handle, int dmabuf_fd,
++                       uint64_t size_B,
+                        enum nvkmd_va_flags va_flags,
+                        uint8_t pte_kind, uint64_t va_align_B,
+                        struct nvkmd_mem **mem_out)
+@@ -75,6 +78,7 @@ create_mem_or_close_bo(struct nvkmd_nvgpu_dev *dev,
+    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nvgpu_mem_ops,
+                   mem_flags, size_B, dev->base.pdev->bind_align_B);
+    mem->nvmap_handle = nvmap_handle;
++   mem->dmabuf_fd = dmabuf_fd;
+ 
+    result = nvkmd_dev_alloc_va(&dev->base, log_obj,
+                                va_flags, pte_kind,
+@@ -223,11 +227,33 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    // if (domains == nvgpu_WS_BO_GART)
+    //    va_flags |= NVKMD_VA_GART;
+ 
+-   return create_mem_or_close_bo(dev, log_obj, flags, handle, size_B,
++   return create_mem_or_close_bo(dev, log_obj, flags, handle, -1, size_B,
+                                  va_flags, pte_kind, va_align_B,
+                                  mem_out);
+ }
+ 
++int
++nvkmd_nvgpu_mem_get_dmabuf_fd(struct nvkmd_nvgpu_mem *mem)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(mem->base.dev);
++
++   if (mem->dmabuf_fd >= 0)
++      return fcntl(mem->dmabuf_fd, F_DUPFD_CLOEXEC, 0);
++
++   struct nvmap_create_handle get_fd_args = {
++      .handle = mem->nvmap_handle,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1)
++      return -1;
++
++   return get_fd_args.fd;
++}
++
++/* Import any dma-buf (nvmap-exported or not): nvgpu's MAP_BUFFER_EX takes a
++ * dma-buf fd directly, so keep our own dup of it and use that wherever the
++ * nvmap-allocated path would call NVMAP_IOC_GET_FD.  No REGISTER_BUFFER: that
++ * only sets up compression state, and imports are mapped uncompressed.
++ */
+ VkResult
+ nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *_dev,
+                              struct vk_object_base *log_obj,
+@@ -235,29 +261,35 @@ nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *_dev,
+ {
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+ 
+-   printf("unimpl: nvkmd_nvgpu_import_dma_buf\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   off_t size = lseek(fd, 0, SEEK_END);
++   if (size <= 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "dma-buf size query failed: %m");
++   lseek(fd, 0, SEEK_SET);
+ 
++   int own_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
++   if (own_fd < 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "dup of dma-buf failed: %m");
+ 
+-   // struct nvgpu_ws_bo *bo = nvgpu_ws_bo_from_dma_buf(dev->ws_dev, fd);
+-   // if (bo == NULL)
+-   //    return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "%m");
+-
+-   // enum nvkmd_mem_flags flags = NVKMD_MEM_SHARED;
+-
+-   // /* We always set LOCAL for shared things because we don't know where the
+-   //  * kernel will place it.  The query only tells us where it is.
+-   //  */
+-   // flags |= NVKMD_MEM_LOCAL;
+-
+-   // if (bo->flags & nvgpu_WS_BO_MAP)
+-   //    flags |= NVKMD_MEM_CAN_MAP;
++   const uint32_t mem_align_B = _dev->pdev->bind_align_B;
+ 
+-   // return create_mem_or_close_bo(dev, log_obj, flags, bo,
+-   //                               0 /* va_flags */,
+-   //                               0 /* pte_kind */,
+-   //                               0 /* va_align_B */,
+-   //                               mem_out);
++   /* We always set LOCAL for shared things: Tegra has only sysmem, which
++    * NVK reports as device-local.  COHERENT: the Orin GPU is I/O-coherent
++    * with CPU caches, and bind maps COHERENT memory SYSTEM_COHERENT, so an
++    * import can back any of NVK's memory types.
++    */
++   enum nvkmd_mem_flags flags = NVKMD_MEM_SHARED | NVKMD_MEM_LOCAL |
++                                NVKMD_MEM_CAN_MAP | NVKMD_MEM_COHERENT;
++
++   VkResult result =
++      create_mem_or_close_bo(dev, log_obj, flags, 0 /* nvmap_handle */,
++                             own_fd, align64(size, mem_align_B),
++                             0 /* va_flags */, 0 /* pte_kind */,
++                             MAX2(mem_align_B, va_align_B), mem_out);
++   if (result != VK_SUCCESS)
++      close(own_fd);
++   return result;
+ }
+ 
+ static void
+@@ -267,9 +299,12 @@ nvkmd_nvgpu_mem_free(struct nvkmd_mem *_mem)
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(mem->base.dev);
+ 
+    nvkmd_va_free(mem->base.va);
+-   if (ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, &mem->nvmap_handle) == -1) {
++   if (mem->dmabuf_fd >= 0) {
++      close(mem->dmabuf_fd);
++   } else if (ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, &mem->nvmap_handle) == -1) {
+       printf("failed NVMAP_IOC_FREE: %d\n", errno);
+    }
++   FREE(mem);
+ 
+ 
+    // printf("unimpl: mem_free\n");
+@@ -289,13 +324,10 @@ nvkmd_nvgpu_mem_map(struct nvkmd_mem *_mem,
+    struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
+ 
+-   struct nvmap_create_handle get_fd_args = {
+-      .handle = mem->nvmap_handle,
+-   };
+-   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
+-      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
+-      return VK_ERROR_UNKNOWN;
+-   }
++   int dmabuf_fd = nvkmd_nvgpu_mem_get_dmabuf_fd(mem);
++   if (dmabuf_fd < 0)
++      return vk_errorf(log_obj, VK_ERROR_MEMORY_MAP_FAILED,
++                       "getting dma-buf fd for map: %m");
+ 
+    int prot = 0;
+    if (map_flags & NVKMD_MEM_MAP_RD)
+@@ -308,9 +340,9 @@ nvkmd_nvgpu_mem_map(struct nvkmd_mem *_mem,
+       flags |= MAP_FIXED;
+ 
+    void *map = mmap(fixed_addr, mem->base.size_B, prot, flags,
+-                    get_fd_args.fd, 0);
++                    dmabuf_fd, 0);
+ 
+-   close(get_fd_args.fd);
++   close(dmabuf_fd);
+ 
+    if (map == MAP_FAILED)
+       return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
+@@ -361,15 +393,11 @@ nvkmd_nvgpu_mem_export_dma_buf(struct nvkmd_mem *_mem,
+    struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
+ 
+-   struct nvmap_create_handle get_fd_args = {
+-      .handle = mem->nvmap_handle,
+-   };
+-   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
+-      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
+-      return VK_ERROR_UNKNOWN;
+-   }
++   int fd = nvkmd_nvgpu_mem_get_dmabuf_fd(mem);
++   if (fd < 0)
++      return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "dma-buf export: %m");
+ 
+-   *fd_out = get_fd_args.fd;
++   *fd_out = fd;
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index 023f7c7186d..cae864cdc81 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -261,15 +261,11 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    // };
+    // return vm_bind(dev, log_obj, &bind);
+ 
+-   struct nvmap_create_handle get_fd_args = {
+-      .handle = mem->nvmap_handle,
+-   };
+-   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
+-      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++   int dmabuf_fd = nvkmd_nvgpu_mem_get_dmabuf_fd(mem);
++   if (dmabuf_fd < 0) {
++      printf("failed to get dma-buf fd for bind: %d\n", errno);
+       return VK_ERROR_UNKNOWN;
+    }
+-
+-   // mmap(NULL, range_B, get_fd_args.fd, )
+    
+    
+    __u32 flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
+@@ -280,7 +276,7 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+       .flags = flags,
+       .compr_kind = NV_KIND_INVALID,
+       .incompr_kind = va->base.pte_kind,
+-      .dmabuf_fd = get_fd_args.fd,
++      .dmabuf_fd = dmabuf_fd,
+       .page_size = 4096, // xxx
+       .buffer_offset = mem_offset_B,
+       .mapping_size = range_B,
+@@ -288,10 +284,11 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    };
+    if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_MAP_BUFFER_EX, &map_buffer_args) == -1) {
+       printf("failed to NVGPU_AS_IOCTL_MAP_BUFFER_EX: %d\n", errno);
++      close(dmabuf_fd);
+       return VK_ERROR_UNKNOWN;
+    }
+ 
+-   close(get_fd_args.fd);
++   close(dmabuf_fd);
+ 
+    if (va->binds_size == va->binds_capacity) {
+       va->binds_capacity = (va->binds_capacity + 1) * 2;
+-- 
+2.56.0
+

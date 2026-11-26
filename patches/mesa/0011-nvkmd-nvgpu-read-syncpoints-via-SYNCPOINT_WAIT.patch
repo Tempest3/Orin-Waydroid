@@ -1,0 +1,52 @@
+From 1a4f01c9d6451e9e1748134746b7e2b3f4bd42c8 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:43:56 -0500
+Subject: [PATCH 11/16] nvkmd/nvgpu: read syncpoints via SYNCPOINT_WAIT
+
+NVIDIA's out-of-tree tegra-drm in L4T R39 does not implement the legacy
+DRM_IOCTL_TEGRA_SYNCPT_READ (EINVAL on every call). A zero-timeout
+SYNCPOINT_WAIT on threshold 0 returns the current value in args.value
+(filled before the threshold check, copied back even on EAGAIN).
+---
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c        | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+index 062bbadb46d..2f2466019d2 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+@@ -5,6 +5,7 @@
+ #include "vk_sync.h"
+ 
+ #include "drm-uapi/tegra_drm.h"
++#include <errno.h>
+ #include <vulkan/vulkan_core.h>
+ 
+ static VkResult
+@@ -74,11 +75,20 @@ nvkmd_nvgpu_sync_get_value(struct vk_device *device,
+       return VK_SUCCESS; // is this correct?
+    }
+ 
+-   struct drm_tegra_syncpt_read read_args = {
++   /* NVIDIA's OOT tegra-drm (L4T R39) has no legacy SYNCPT_READ ioctl.
++    * SYNCPOINT_WAIT stores the current value in args.value before checking
++    * the threshold, and DRM copies args back even on error, so a zero-timeout
++    * wait on threshold 0 doubles as a read (0 if expired, EAGAIN otherwise).
++    */
++   struct drm_tegra_syncpoint_wait read_args = {
++      .timeout_ns = 0,
+       .id = sobj->syncpoint_id,
++      .threshold = 0,
+    };
+-   if (ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPT_READ, &read_args) == -1) {
+-      printf("failed DRM_IOCTL_TEGRA_SYNCPT_READ: %d\n", errno);
++   if (ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &read_args) == -1 &&
++       errno != EAGAIN) {
++      printf("failed to read syncpoint %u via SYNCPOINT_WAIT: %d\n",
++             sobj->syncpoint_id, errno);
+       return VK_ERROR_UNKNOWN;
+    }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,27 @@
+From d1a7f686b4cc64cacf70af65212c69899aa973d9 Mon Sep 17 00:00:00 2001
+From: Russell Greene <russellgreene8@gmail.com>
+Date: Sat, 11 Oct 2025 00:35:39 -0600
+Subject: [PATCH 06/16] nvrm/nvgpu: add missing mutex & list init
+
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+index 7b41f9e126c..8a9ae1eee36 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+@@ -39,7 +39,9 @@ nvkmd_nvgpu_create_dev(struct nvkmd_pdev *_pdev,
+    dev->nvmap_fd = open("/dev/nvmap", O_RDWR | O_CLOEXEC);
+    // dev->modeset_fd = open("/dev/nvidia-modeset", O_RDWR | O_CLOEXEC);
+    // dev->host1x_fd = open("/dev/host1x-fence");
+-   
++
++   list_inithead(&dev->base.mems);
++   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+ 
+    struct nvmap_available_heaps heaps = {.heaps = 1345};
+    if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_AVAILABLE_HEAPS, &heaps) == -1) {
+-- 
+2.56.0
+

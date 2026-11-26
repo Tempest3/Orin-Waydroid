@@ -1,0 +1,59 @@
+From 169e40c4f13393f6bfe84e47b6d023e4a3055847 Mon Sep 17 00:00:00 2001
+From: Russell Greene <russellgreene8@gmail.com>
+Date: Tue, 25 Mar 2025 17:02:31 -0600
+Subject: [PATCH 03/16] nvkmd: add NVK_ON_NVGPU debug env var to select nvgpu
+ kmd
+
+---
+ docs/drivers/nvk.rst             |  5 +++++
+ src/nouveau/vulkan/nvkmd/nvkmd.c | 11 +++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/docs/drivers/nvk.rst b/docs/drivers/nvk.rst
+index 3835878610c..07b156b54da 100644
+--- a/docs/drivers/nvk.rst
++++ b/docs/drivers/nvk.rst
+@@ -99,6 +99,11 @@ specific to NVK:
+    poorly tested or completely broken.  This is intended for developer use
+    only.
+ 
++.. envar:: NVK_ON_NVGPU
++
++   If defined to ``1`` or ``true``, this will enable enumeration on the nvgpu
++   kernel driver.  This is intended for developer use only.
++
+ Developer info
+ --------------
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
+index c92046def4d..b9ea13ce7cd 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c
+@@ -5,6 +5,8 @@
+ 
+ #include "nvkmd.h"
+ #include "nouveau/nvkmd_nouveau.h"
++#include "nvgpu/nvkmd_nvgpu.h"
++#include "util/u_debug.h"
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
+ #include "util/u_math.h"
+@@ -88,8 +90,13 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
+                               enum nvk_debug debug_flags,
+                               struct nvkmd_pdev **pdev_out)
+ {
+-   return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
+-                                        debug_flags, pdev_out);
++   if (debug_get_bool_option("NVK_ON_NVGPU", false)) {
++      return nvkmd_nvgpu_try_create_pdev(drm_device, log_obj,
++                                         debug_flags, pdev_out);
++   } else {
++      return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
++                                           debug_flags, pdev_out);
++   }
+ }
+ 
+ VkResult MUST_CHECK
+-- 
+2.56.0
+

@@ -1,0 +1,133 @@
+From 5bd4ce5e4e130fcee82dea8833d3f7238f461617 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 01:47:17 -0500
+Subject: [PATCH] nvkmd/nvgpu: invalidate GPU L2 sysmem lines at the start of
+ each submit
+
+The GPU L2 caches sysmem, does not snoop CPU writes (SYSTEM_COHERENT
+maps included), and nvgpu never invalidates it. Once a buffer has been
+read by the GPU, later CPU writes were invisible to it indefinitely: a
+copy test (vkl2stale) got iteration-0 data back for the whole run, for
+both the HOST_CACHED and the HOST_COHERENT memory types.
+
+Prefix every GPFIFO submission with WFI, L2 FLUSH_DIRTY and
+L2_SYSMEM_INVALIDATE (the counterpart of the flush appended on signal).
+NVK_NVGPU_L2_INVALIDATE=0 disables it for testing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  |  2 +
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 56 +++++++++++++++++--
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index 45084a92095..cc2ca66ceff 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -129,6 +129,8 @@ struct nvkmd_nvgpu_exec_ctx {
+    struct nvkmd_mem *zcull_buf;
+    struct nvkmd_mem *flush_push; /* WFI + L2 flush + sysmembar, see ctx.c */
+    uint32_t flush_push_size_B;
++   uint32_t inval_push_size_B;   /* WFI + L2 flush dirty + L2 sysmem invalidate, at +0x800 */
++   bool l2_inval;                /* NVK_NVGPU_L2_INVALIDATE (default on) */
+ 
+    int push_count;
+    bool is_fence_filled;
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index c093b6559d4..a29ecbc5829 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -18,6 +18,9 @@
+ #include "drm-uapi/tegra_drm.h"
+ #include "util/u_memory.h"
+ #include "util/log.h"
++#include "util/u_debug.h"
++
++#define INVAL_PUSH_OFFSET_B 0x800
+ #include <inttypes.h>
+ #include "vulkan/vulkan_core.h"
+ #include <sys/ioctl.h>
+@@ -85,6 +88,7 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+     * the fence signalled.  Keep a tiny push buffer that we append to every
+     * submission that signals: WFI, L2 FLUSH_DIRTY, then a SYS_MEMBAR.
+     */
++   ctx->l2_inval = debug_get_bool_option("NVK_NVGPU_L2_INVALIDATE", true);
+    err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj, 0x1000, 0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR, &ctx->flush_push);
+    if (err != VK_SUCCESS)
+       return err;
+@@ -105,6 +109,29 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+       p[n++] = NVC56F_MEM_OP_C_MEMBAR_TYPE_SYS_MEMBAR;
+       p[n++] = NVC56F_MEM_OP_D_OPERATION_MEMBAR << 27;
+       ctx->flush_push_size_B = n * 4;
++
++      /* Prelude for every GPFIFO submission (at INVAL_PUSH_OFFSET_B): the
++       * GPU L2 caches sysmem and nvgpu never invalidates it, so data the CPU
++       * wrote after an earlier GPU read (uniforms, vertex data, descriptors,
++       * shaders, "HOST_COHERENT" memory included) would be served stale from
++       * L2 indefinitely (scripts/vkl2stale.c).  WFI, write back dirty lines,
++       * then drop the clean sysmem lines.
++       */
++      p = (uint32_t *)((char *)ctx->flush_push->map + INVAL_PUSH_OFFSET_B);
++      n = 0;
++      p[n++] = HOST_INC(NVC56F_WFI, 1);
++      p[n++] = NVC56F_WFI_SCOPE_ALL;
++      p[n++] = HOST_INC(NVC56F_MEM_OP_A, 4);
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = NVC56F_MEM_OP_D_OPERATION_L2_FLUSH_DIRTY << 27;
++      p[n++] = HOST_INC(NVC56F_MEM_OP_A, 4);
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = 0;
++      p[n++] = NVC56F_MEM_OP_D_OPERATION_L2_SYSMEM_INVALIDATE << 27;
++      ctx->inval_push_size_B = n * 4;
+ #undef HOST_INC
+    }
+ 
+@@ -404,10 +431,10 @@ nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+ }
+ 
+ static VkResult
+-nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+-                            struct vk_object_base *log_obj,
+-                            uint32_t exec_count,
+-                            const struct nvkmd_ctx_exec *execs)
++nvkmd_nvgpu_exec_ctx_exec_raw(struct nvkmd_ctx *_ctx,
++                              struct vk_object_base *log_obj,
++                              uint32_t exec_count,
++                              const struct nvkmd_ctx_exec *execs)
+ {
+    struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+ 
+@@ -444,6 +471,27 @@ nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
++                          struct vk_object_base *log_obj,
++                          uint32_t exec_count,
++                          const struct nvkmd_ctx_exec *execs)
++{
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   /* First entry of a new GPFIFO submission: invalidate GPU L2 sysmem lines. */
++   if (ctx->push_count == 0 && exec_count > 0 && ctx->l2_inval) {
++      const struct nvkmd_ctx_exec inval = {
++         .addr = ctx->flush_push->va->addr + INVAL_PUSH_OFFSET_B,
++         .size_B = ctx->inval_push_size_B,
++      };
++      VkResult result = nvkmd_nvgpu_exec_ctx_exec_raw(_ctx, log_obj, 1, &inval);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++   return nvkmd_nvgpu_exec_ctx_exec_raw(_ctx, log_obj, exec_count, execs);
++}
++
+ static VkResult
+ nvkmd_nvgpu_exec_ctx_push_flush(struct nvkmd_nvgpu_exec_ctx *ctx,
+                                 struct vk_object_base *log_obj)
+-- 
+2.56.0
+

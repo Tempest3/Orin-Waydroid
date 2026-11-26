@@ -1,0 +1,2326 @@
+From a6302027d30760717051102fe76e38a3681057b7 Mon Sep 17 00:00:00 2001
+From: Russell Greene <russellgreene8@gmail.com>
+Date: Wed, 26 Mar 2025 07:10:24 +0000
+Subject: [PATCH 04/16] nvkmd/nvgpu: add initial nvgpu kmd backend
+
+---
+ src/nouveau/vulkan/meson.build                |   1 +
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  | 138 +++++-
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 431 +++++++++++++-----
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c      | 132 ++++--
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c      | 306 +++++++++----
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     | 247 +++++++---
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c     | 201 ++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c       | 373 +++++++++------
+ 8 files changed, 1372 insertions(+), 457 deletions(-)
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index d93658239cb..b80bd7a60e7 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -100,6 +100,7 @@ nvk_files = files(
+   'nvkmd/nvgpu/nvkmd_nvgpu_dev.c',
+   'nvkmd/nvgpu/nvkmd_nvgpu_mem.c',
+   'nvkmd/nvgpu/nvkmd_nvgpu_pdev.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_sync.c',
+   'nvkmd/nvgpu/nvkmd_nvgpu_va.c',
+   'nvkmd/nvkmd.c',
+   'nvkmd/nvkmd.h',
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index 2f32db3f79e..9ccd6208e93 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -1,9 +1,11 @@
++#include "drm-uapi/nvgpu.h"
+ #include "nvkmd/nvkmd.h"
+ #include "vk_drm_syncobj.h"
+ #include "util/vma.h"
+ 
+ #include "drm-uapi/nouveau_drm.h"
+ 
++#include <sys/ioctl.h>
+ #include <sys/types.h>
+ struct nvkmd_nvgpu_pdev {
+    struct nvkmd_pdev base;
+@@ -11,10 +13,12 @@ struct nvkmd_nvgpu_pdev {
+    // /* Used for get_vram_used() */
+    // struct nouveau_ws_device *ws_dev;
+ 
+-   // int primary_fd;
++   int primary_fd;
++   int render_fd;
++   int ctrl_fd;
+ 
+-   // struct vk_sync_type syncobj_sync_type;
+-   // const struct vk_sync_type *sync_types[2];
++   struct vk_sync_type syncobj_sync_type;
++   const struct vk_sync_type *sync_types[2];
+ };
+ 
+ NVKMD_DECL_SUBCLASS(pdev, nvgpu);
+@@ -24,14 +28,37 @@ VkResult nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+                                        enum nvk_debug debug_flags,
+                                        struct nvkmd_pdev **pdev_out);
+ 
++
++                                       
++// #define NVKMD_NVGPU_HEAP_START ((uint64_t)4096)
++// #define NVKMD_NVGPU_HEAP_END ((uint64_t)(1ull << 38))
++
++#define NVKMD_NVGPU_HEAP_START ((uint64_t)0x0000000004000000)
++#define NVKMD_NVGPU_HEAP_END ((uint64_t)(1ull << 37))
++
++#define NVKMD_NVGPU_REPLAY_HEAP_START NVKMD_NVGPU_HEAP_END
++#define NVKMD_NVGPU_REPLAY_HEAP_END \
++   ((uint64_t)(1ull << 38)) // xxx
++
++#define NVGPU_GPFIFO_SIZE 0x1000 // what nvidia passes
++
+ struct nvkmd_nvgpu_dev {
+    struct nvkmd_dev base;
+ 
++   int ctrl_fd;
++   int nvmap_fd;
++   // int modeset_fd;
++   // int host1x_fence_fd;
++
+    // struct nouveau_ws_device *ws_dev;
+ 
+-   // simple_mtx_t heap_mutex;
+-   // struct util_vma_heap heap;
+-   // struct util_vma_heap replay_heap;
++   int heap_as_fd;
++   struct nvgpu_as_va_region* regions;
++   size_t regions_size;
++
++   simple_mtx_t heap_mutex;
++   struct util_vma_heap heap;
++   struct util_vma_heap replay_heap;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(dev, nvgpu);
+@@ -40,6 +67,12 @@ VkResult nvkmd_nvgpu_create_dev(struct nvkmd_pdev *pdev,
+                                   struct vk_object_base *log_obj,
+                                   struct nvkmd_dev **dev_out);
+ 
++struct nvkmd_nvgpu_mem {
++   struct nvkmd_mem base;
++   uint32_t nvmap_handle;
++};
++NVKMD_DECL_SUBCLASS(mem, nvgpu);
++
+ VkResult nvkmd_nvgpu_alloc_mem(struct nvkmd_dev *dev,
+                                  struct vk_object_base *log_obj,
+                                  uint64_t size_B, uint64_t align_B,
+@@ -57,12 +90,61 @@ VkResult nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *dev,
+                                       struct vk_object_base *log_obj,
+                                       int fd, struct nvkmd_mem **mem_out);
+ 
++struct nvkmd_nvgpu_bind {
++   uint64_t offset;
++   uint64_t size;
++};
++
+ struct nvkmd_nvgpu_va {
+    struct nvkmd_va base;
++
++
++   struct nvkmd_nvgpu_bind* binds;
++   size_t binds_size;
++   size_t binds_capacity;
++   // int fd;
+ };
+ 
+ NVKMD_DECL_SUBCLASS(va, nvgpu);
+ 
++struct nvkmd_nvgpu_exec_ctx {
++   struct nvkmd_ctx base;
++
++   int channel_fd;
++   int tsg_fd;
++   uint32_t veid;
++   uint64_t copy_object_id;
++   uint64_t threeD_object_id;
++   uint64_t twoD_object_id;
++   uint64_t m2mf_object_id;
++   uint64_t compute_object_id;
++   // struct nvkmd_mem *notifier;
++   // struct nvkmd_mem *userD;
++   struct nvkmd_mem *gp_fifo;
++   struct nvkmd_mem *zcull_buf;
++
++   int push_count;
++   bool is_fence_filled;
++   struct nvgpu_fence fence;
++   // struct nvkmd_mem *cmdBuf;
++   // NvHandle hCtxDma;
++   // NvHandle hChannel;
++   // struct {
++	//    NvHandle hCopy;
++	//    NvHandle hEng2d;
++	//    NvHandle hEng3d;
++	//    NvHandle hM2mf;
++	//    NvHandle hCompute;
++   // } subchannels;
++   // int osEvent;
++   // struct NvRmSemSurf *semSurf;
++   // uint64_t wSeq;
++   // uint64_t gpGet;
++   // uint64_t gpPut;
++};
++
++NVKMD_DECL_SUBCLASS(ctx, nvgpu_exec);
++
+ VkResult nvkmd_nvgpu_alloc_va(struct nvkmd_dev *dev,
+                                 struct vk_object_base *log_obj,
+                                 enum nvkmd_va_flags flags, uint8_t pte_kind,
+@@ -87,3 +169,47 @@ VkResult nvkmd_nvgpu_create_ctx(struct nvkmd_dev *dev,
+                                   struct vk_object_base *log_obj,
+                                   enum nvkmd_engines engines,
+                                   struct nvkmd_ctx **ctx_out);
++
++struct nvkmd_nvgpu_sync {
++   struct vk_sync base;
++
++   bool initialized;
++   uint32_t syncpoint_id;
++
++   int64_t local_offset; // offset from drm value to logical value
++};
++
++void
++nvkmd_nvgpu_sync_finish(struct vk_device *device,
++                       struct vk_sync *sync);
++
++static inline bool
++vk_sync_type_is_nvkmd_nvgpu_sync(const struct vk_sync_type *type)
++{
++   return type->finish == nvkmd_nvgpu_sync_finish;
++}
++
++static inline struct nvkmd_nvgpu_sync *
++vk_sync_as_nvgpu_sync(struct vk_sync *sync)
++{
++   if (!vk_sync_type_is_nvkmd_nvgpu_sync(sync->type))
++      return NULL;
++
++   return container_of(sync, struct nvkmd_nvgpu_sync, base);
++}
++
++struct vk_sync_type
++nvkmd_nvgpu_sync_get_type(struct nvkmd_nvgpu_pdev *pdev);
++
++
++static inline int nvgpu_ioctl(int fd, int num, void* ptr) {
++   while(true) {
++      if (ioctl(fd, num, ptr) == -1) {
++         if (errno == EAGAIN) {
++            continue;
++         }
++         return -1;
++      }
++      return 0;
++   }
++}
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index 2457dca7711..5fc93d9f7e4 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -3,42 +3,30 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "cla16f.h"
++#include "nvk_device.h"
+ #include "nvkmd_nvgpu.h"
+ 
+-#include "nouveau_bo.h"
+-#include "nouveau_context.h"
+-#include "nouveau_device.h"
+-#include "vk_drm_syncobj.h"
++#include "nvtypes.h"
+ #include "vk_log.h"
++#include "vk_sync.h"
+ 
++#include <stdint.h>
++#include <string.h>
+ #include <xf86drm.h>
++#include "drm-uapi/tegra_drm.h"
++#include "util/u_memory.h"
++#include "vulkan/vulkan_core.h"
++#include <sys/ioctl.h>
+ 
+-// static ALWAYS_INLINE VkResult
+-// nvkmd_nvgpu_ctx_add_sync(struct nvkmd_ctx *ctx,
+-//                            struct vk_object_base *log_obj,
+-//                            uint32_t *nvgpu_sync_count,
+-//                            struct drm_nvgpu_sync *nvgpu_syncs,
+-//                            struct vk_sync *sync,
+-//                            uint64_t sync_value)
+-// {
+-//    if (unlikely(*nvgpu_sync_count >= NVKMD_nvgpu_MAX_SYNCS)) {
+-//       VkResult result = ctx->ops->flush(ctx, log_obj);
+-//       if (result != VK_SUCCESS)
+-//          return result;
+-//    }
+-
+-//    struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(sync);
+-//    assert(syncobj != NULL);
+-
+-//    nvgpu_syncs[(*nvgpu_sync_count)++] = (struct drm_nvgpu_sync) {
+-//       .flags = sync_value ? DRM_nvgpu_SYNC_TIMELINE_SYNCOBJ :
+-//                             DRM_nvgpu_SYNC_SYNCOBJ,
+-//       .handle = syncobj->syncobj,
+-//       .timeline_value = sync_value,
+-//    };
+-
+-//    return VK_SUCCESS;
+-// }
++#include "drm-uapi/nvgpu-ctrl.h"
++#include "drm-uapi/nvgpu-as.h"
++#include "drm-uapi/nvgpu.h"
++// #include "drm-uapi/nvmisc.h"
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj);
+ 
+ static VkResult
+ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+@@ -46,15 +34,141 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+                               enum nvkmd_engines engines,
+                               struct nvkmd_ctx **ctx_out)
+ {
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+-   // int err;
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   VkResult err;
++
++   struct nvkmd_nvgpu_exec_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_exec_ctx);
++   if (ctx == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   ctx->base.ops = &nvkmd_nvgpu_exec_ctx_ops;
++   ctx->base.dev = &dev->base;
++
++   err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj, 0x40000,  0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,  &ctx->gp_fifo);
++   if (err != VK_SUCCESS)
++   	return err;
++
++   err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj, 0x100000,  0x10000, NVKMD_MEM_VRAM, NVKMD_MEM_MAP_RDWR,  &ctx->zcull_buf); // xx how large? nvidia aligns to 0x1000
++   if (err != VK_SUCCESS)
++   	return err;
++
++   struct nvgpu_gpu_open_channel_args open_args = {
++      .in.runlist_id = 0 // what nvidia passes
++   };
++   if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_OPEN_CHANNEL, &open_args) == -1) {
++      printf("failed to NVGPU_GPU_IOCTL_OPEN_CHANNEL: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++   ctx->channel_fd = open_args.out.channel_fd;
++
++   struct nvgpu_gpu_open_tsg_args open_tsg_args = {
++      .flags = 0,
++   };
++   if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_OPEN_TSG, &open_tsg_args) == -1) {
++      printf("failed to NVGPU_GPU_IOCTL_OPEN_TSG: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++   ctx->tsg_fd = open_tsg_args.tsg_fd;
++
++   struct nvgpu_tsg_create_subcontext_args create_subcontext_args = {
++      .type = NVGPU_TSG_SUBCONTEXT_TYPE_SYNC,
++      .as_fd = dev->heap_as_fd,
++   };
++   if (ioctl(ctx->tsg_fd, NVGPU_TSG_IOCTL_CREATE_SUBCONTEXT, &create_subcontext_args) == -1) {
++      printf("failed to NVGPU_TSG_IOCTL_CREATE_SUBCONTEXT: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++   ctx->veid = create_subcontext_args.veid;
++
++   struct nvgpu_as_bind_channel_args bind_channel_args = {
++      .channel_fd = ctx->channel_fd
++   };
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_BIND_CHANNEL, &bind_channel_args) == -1) {
++      printf("failed to NVGPU_AS_IOCTL_BIND_CHANNEL: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   struct nvgpu_tsg_bind_channel_ex_args tsg_bind_channel_args = {
++      .channel_fd = ctx->channel_fd,
++      .subcontext_id = ctx->veid,
++   };
++   if (ioctl(ctx->tsg_fd, NVGPU_TSG_IOCTL_BIND_CHANNEL_EX, &tsg_bind_channel_args) == -1) {
++      printf("failed to NVGPU_TSG_IOCTL_BIND_CHANNEL_EX: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   // TODO: move to SETUP_BIND, this syscall is deprecated
++   struct nvgpu_alloc_gpfifo_ex_args alloc_gpfifo_args = {
++      .num_entries = NVGPU_GPFIFO_SIZE,
++      .num_inflight_jobs = 0x100, // what nvidia passes
++   };
++   if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_GPFIFO_EX, &alloc_gpfifo_args) == -1) {
++      printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_GPFIFO_EX: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   // unclear to me what exactly this does
++   struct nvgpu_alloc_obj_ctx_args alloc_obj_ctx_args = {
++      .flags = 0, // NVGPU_ALLOC_OBJ_FLAGS_*
++   };
++
++   if (engines & NVKMD_ENGINE_COPY) {
++      alloc_obj_ctx_args.class_num = dev->base.pdev->dev_info.cls_copy;
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, &alloc_obj_ctx_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++      ctx->copy_object_id = alloc_obj_ctx_args.obj_id;
++   }
++   if (engines & NVKMD_ENGINE_2D) {
++      alloc_obj_ctx_args.class_num = dev->base.pdev->dev_info.cls_eng2d;
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, &alloc_obj_ctx_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++      ctx->twoD_object_id = alloc_obj_ctx_args.obj_id;
++   }
++   if (engines & NVKMD_ENGINE_3D) {
++      alloc_obj_ctx_args.class_num = dev->base.pdev->dev_info.cls_eng3d;
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, &alloc_obj_ctx_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++      ctx->threeD_object_id = alloc_obj_ctx_args.obj_id;
++   }
++   if (engines & NVKMD_ENGINE_M2MF) {
++      alloc_obj_ctx_args.class_num = dev->base.pdev->dev_info.cls_m2mf;
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, &alloc_obj_ctx_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++      ctx->m2mf_object_id = alloc_obj_ctx_args.obj_id;
++   }
++   if (engines & NVKMD_ENGINE_COMPUTE) {
++      alloc_obj_ctx_args.class_num = dev->base.pdev->dev_info.cls_compute;
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, &alloc_obj_ctx_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++      ctx->compute_object_id = alloc_obj_ctx_args.obj_id;
++   }
++
++   // TODO:
++   // struct nvgpu_set_error_notifier set_error_notifier_args = {
++   //    // .
++   // };
++
++   struct nvgpu_zcull_bind_args zcull_bind_args = {
++      .gpu_va = ctx->zcull_buf->va->addr,
++      .mode =  NVGPU_ZCULL_MODE_SEPARATE_BUFFER,
++   };
++   if (ioctl(ctx->channel_fd, NVGPU_ZCULL_MODE_SEPARATE_BUFFER, &zcull_bind_args) == -1) {
++      printf("failed to NVGPU_IOCTL_CHANNEL_ZCULL_BIND: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
+ 
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_exec_ctx);
+-   // if (ctx == NULL)
+-   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   // struct nvgpu_as_bind_channel_args bind_args;
+ 
+-   // ctx->base.ops = &nvkmd_nvgpu_exec_ctx_ops;
+-   // ctx->base.dev = &dev->base;
+    // ctx->ws_dev = dev->ws_dev;
+ 
+    // STATIC_ASSERT(NVKMD_ENGINE_COPY     == (int)nvgpu_WS_ENGINE_COPY);
+@@ -91,12 +205,9 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+    //    .sig_ptr = (uintptr_t)&ctx->req_sig,
+    // };
+ 
+-   // *ctx_out = &ctx->base;
++   *ctx_out = &ctx->base;
+ 
+-   // return VK_SUCCESS;
+-
+-   printf("unimpl: nvkmd_nvgpu_create_exec_ctx\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   return VK_SUCCESS;
+ }
+ 
+ static void
+@@ -119,30 +230,59 @@ nvkmd_nvgpu_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+                             uint32_t wait_count,
+                             const struct vk_sync_wait *waits)
+ {
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+-
+-   // for (uint32_t i = 0; i < wait_count; i++) {
+-   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
+-   //                                                 &ctx->req.wait_count,
+-   //                                                 ctx->req_wait,
+-   //                                                 waits[i].sync,
+-   //                                                 waits[i].wait_value);
+-   //    if (result != VK_SUCCESS)
+-   //       return result;
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++
++   for (uint32_t i = 0; i < wait_count; i++) {
++      if (ctx->is_fence_filled) {
++         VkResult res = nvkmd_nvgpu_exec_ctx_flush(_ctx, log_obj);
++         if (res != VK_SUCCESS) { return res; }
++      }
++      assert(!ctx->is_fence_filled);
++      ctx->is_fence_filled = true;
++
++      struct nvkmd_nvgpu_sync *sync = vk_sync_as_nvgpu_sync(waits[i].sync);
++      assert(sync != NULL);
++      assert(sync->initialized);
++
++      ctx->fence = (struct nvgpu_fence) {
++         .id = sync->syncpoint_id,
++         .value = waits[i].wait_value,
++      };
++
++      // VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
++      //                                              &ctx->req.wait_count,
++      //                                              ctx->req_wait,
++      //                                              waits[i].sync,
++      //                                              waits[i].wait_value);
++
++         // nvgpu_syncs[(*nvgpu_sync_count)++] = (struct drm_nvgpu_sync) {
++      //    .flags = sync_value ? DRM_nvgpu_SYNC_TIMELINE_SYNCOBJ :
++      //                          DRM_nvgpu_SYNC_SYNCOBJ,
++      //    .handle = syncobj->syncobj,
++      //    .timeline_value = sync_value,
+    // }
+ 
+-   // return VK_SUCCESS;
+ 
+-   printf("unimpl: nvkmd_nvgpu_exec_ctx_wait\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++      // if (result != VK_SUCCESS)
++      //    return result;
++   }
++
++   return VK_SUCCESS;
++
++   // printf("unimpl: nvkmd_nvgpu_exec_ctx_wait\n");
++   // sleep(1);
++   // return VK_SUCCESS;
+ }
+ 
+ static VkResult
+-nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+-                             struct vk_object_base *log_obj)
++nvkmd_nvgpu_exec_ctx_flush_impl(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj,
++                             struct nvgpu_fence *fence_out
++                           )
+ {
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+-
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++   
+    // if (ctx->req.push_count == 0 &&
+    //     ctx->req.wait_count == 0 &&
+    //     ctx->req.sig_count == 0)
+@@ -163,8 +303,39 @@ nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+ 
+    // return VK_SUCCESS;
+ 
+-   printf("unimpl: nvkmd_nvgpu_exec_ctx_flush\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   __u32 flags = NVGPU_SUBMIT_GPFIFO_FLAGS_HW_FORMAT; // nvidia sets HW_FORMAT, not exactly sure what it does;
++   if (ctx->is_fence_filled) {
++      flags |= NVGPU_SUBMIT_GPFIFO_FLAGS_FENCE_WAIT;
++   }
++   if (fence_out != NULL) {
++      flags |= NVGPU_SUBMIT_GPFIFO_FLAGS_FENCE_GET;
++   }
++
++   struct nvgpu_submit_gpfifo_args submit_args = {
++      .gpfifo = (__u64)ctx->gp_fifo->map,
++      .num_entries = ctx->push_count,
++      .flags = flags,
++      .fence = ctx->fence,
++   };
++   if (nvgpu_ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_SUBMIT_GPFIFO, &submit_args) == -1) {
++      printf("failed to NVGPU_IOCTL_CHANNEL_SUBMIT_GPFIFO %d (%s)\n", errno, strerror(errno));
++      return VK_ERROR_UNKNOWN;
++   }
++   ctx->push_count = 0; 
++   ctx->is_fence_filled = false;
++
++   if (fence_out != NULL) {
++      *fence_out = submit_args.fence;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj)
++{
++   return  nvkmd_nvgpu_exec_ctx_flush_impl(_ctx, log_obj, NULL);
+ }
+ 
+ static VkResult
+@@ -173,34 +344,39 @@ nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+                             uint32_t exec_count,
+                             const struct nvkmd_ctx_exec *execs)
+ {
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+-
+-   // for (uint32_t i = 0; i < exec_count; i++) {
+-   //    if (unlikely(ctx->req.push_count >= ctx->max_push)) {
+-   //       VkResult result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
+-   //       if (result != VK_SUCCESS)
+-   //          return result;
+-   //    }
+-
+-   //    /* This is the hardware limit on all current GPUs */
+-   //    assert((execs[i].addr % 4) == 0 && (execs[i].size_B % 4) == 0);
+-   //    assert(execs[i].size_B < (1u << 23));
+-
+-   //    uint32_t flags = 0;
+-   //    if (execs[i].no_prefetch)
+-   //       flags |= DRM_nvgpu_EXEC_PUSH_NO_PREFETCH;
+-
+-   //    ctx->req_push[ctx->req.push_count++] = (struct drm_nvgpu_exec_push) {
+-   //       .va = execs[i].addr,
+-   //       .va_len = execs[i].size_B,
+-   //       .flags = flags,
+-   //    };
+-   // }
+-
+-   // return VK_SUCCESS;
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   for (uint32_t i = 0; i < exec_count; i++) {
++      if (unlikely(ctx->push_count >= NVGPU_GPFIFO_SIZE)) {
++         VkResult result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++         if (result != VK_SUCCESS)
++            return result;
++      }
++
++      /* This is the hardware limit on all current GPUs */
++      assert((execs[i].addr % 4) == 0 && (execs[i].size_B % 4) == 0);
++      assert(execs[i].size_B < (1u << 23));
++
++      // insert into gpfifo
++      struct nvgpu_gpfifo *fifo_ptr = (struct nvgpu_gpfifo*)ctx->gp_fifo->map;
++
++      #define DRF_ISBIT(bitval,drf)                \
++        ( /* coverity[identical_branches] */ \
++          (bitval != 0) ? drf )
++      #define DRF_SHIFT(drf)          ((DRF_ISBIT(0,drf)) % 32)
++      #define DRF_NUM(d,r,f,n)        ((((NvU32)(n))&DRF_MASK(NV ## d ## r ## f))<<DRF_SHIFT(NV ## d ## r ## f))
++      #define DRF_MASK(drf)           (0xFFFFFFFFU>>(31-((DRF_ISBIT(1,drf)) % 32)+((DRF_ISBIT(0,drf)) % 32)))
++
++      fifo_ptr[ctx->push_count].entry0 = DRF_NUM(A16F, _GP_ENTRY0, _GET, (execs[i].addr & 0xffffffff) >> 2);
++      fifo_ptr[ctx->push_count].entry1 =
++         DRF_NUM(A16F, _GP_ENTRY1, _GET_HI, ((execs[i].addr >> 32) & 0xffffffff)) |
++         DRF_NUM(A16F, _GP_ENTRY1, _LENGTH, (execs[i].size_B >> 2)) |
++         DRF_NUM(A16F, _GP_ENTRY1, _SYNC, (execs[i].no_prefetch ? NVA16F_GP_ENTRY1_SYNC_WAIT : NVA16F_GP_ENTRY1_SYNC_PROCEED));
++
++      ctx->push_count = (ctx->push_count + 1) % NVGPU_GPFIFO_SIZE;
++   }
+ 
+-   printf("unimpl: nvkmd_nvgpu_exec_ctx_exec\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -209,30 +385,53 @@ nvkmd_nvgpu_exec_ctx_signal(struct nvkmd_ctx *_ctx,
+                               uint32_t signal_count,
+                               const struct vk_sync_signal *signals)
+ {
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+-
+-   // for (uint32_t i = 0; i < signal_count; i++) {
+-   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
+-   //                                                 &ctx->req.sig_count,
+-   //                                                 ctx->req_sig,
+-   //                                                 signals[i].sync,
+-   //                                                 signals[i].signal_value);
+-   //    if (result != VK_SUCCESS)
+-   //       return result;
+-   // }
+-
+-   // return nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   struct nvgpu_fence fence;
++   VkResult res = nvkmd_nvgpu_exec_ctx_flush_impl(&ctx->base, log_obj, signal_count == 0 ? NULL : &fence);
++   if (res != VK_SUCCESS) { return res; }
++
++   if (signal_count != 0) {
++      for (uint32_t i = 0; i < signal_count; i++) {
++         struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(signals[i].sync);
++         // assert(!sobj->initialized); this seems to get hit, not sure if OK
++
++         // if (sobj->base.flags & VK_SYNC_IS_TIMELINE) {
++         // printf("(vk=%p nv=%d tl=%d) submitted--nv.value=%d vk.value=%lu\n", signals[i].sync, fence.id, sobj->base.flags & VK_SYNC_IS_TIMELINE, fence.value, signals[i].signal_value);
++            sobj->local_offset = signals[i].signal_value - fence.value ; // maybe??
++         // }
++
++         sobj->initialized = true;
++         sobj->syncpoint_id = fence.id;
++         // signals[i].signal_value = fence.value;
++      }
++   }
+ 
+-   printf("unimpl: nvkmd_nvgpu_exec_ctx_signal\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+ nvkmd_nvgpu_exec_ctx_sync(struct nvkmd_ctx *_ctx,
+                             struct vk_object_base *log_obj)
+ {
+-   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
+-   // VkResult result;
++   struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_ctx->dev->pdev);
++
++   struct nvgpu_fence fence;
++   VkResult res = nvkmd_nvgpu_exec_ctx_flush_impl(&ctx->base, log_obj, &fence);
++   if (res != VK_SUCCESS) { return res; }
++
++   struct drm_tegra_syncpoint_wait wait_arg = {
++      .timeout_ns = -1,
++      .id = fence.id,
++      .threshold = fence.value, // +1?
++   };
++   if (nvgpu_ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait_arg) == -1) {
++      printf("sync: failed to DRM_IOCTL_TEGRA_SYNCPOINT_WAIT: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   return VK_SUCCESS;
+ 
+    // if (unlikely(ctx->req.sig_count >= NVKMD_nvgpu_MAX_SYNCS)) {
+    //    result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
+@@ -272,7 +471,7 @@ nvkmd_nvgpu_exec_ctx_sync(struct nvkmd_ctx *_ctx,
+    // return VK_SUCCESS;
+ 
+    printf("unimpl: nvkmd_nvgpu_exec_ctx_sync\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   return VK_SUCCESS;
+ }
+ 
+ const struct nvkmd_ctx_ops nvkmd_nvgpu_exec_ctx_ops = {
+@@ -289,15 +488,14 @@ nvkmd_nvgpu_create_bind_ctx(struct nvkmd_dev *_dev,
+                               struct vk_object_base *log_obj,
+                               struct nvkmd_ctx **ctx_out)
+ {
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+ 
+-   // struct nvkmd_nvgpu_bind_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_bind_ctx);
+-   // if (ctx == NULL)
+-   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   struct nvkmd_nvgpu_bind_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_bind_ctx);
++   if (ctx == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   // ctx->base.ops = &nvkmd_nvgpu_bind_ctx_ops;
+-   // ctx->base.dev = &dev->base;
+-   // ctx->ws_dev = dev->ws_dev;
++   ctx->base.ops = &nvkmd_nvgpu_bind_ctx_ops;
++   ctx->base.dev = &dev->base;
+ 
+    // ctx->req = (struct drm_nvgpu_vm_bind) {
+    //    .flags = DRM_nvgpu_VM_BIND_RUN_ASYNC,
+@@ -309,12 +507,9 @@ nvkmd_nvgpu_create_bind_ctx(struct nvkmd_dev *_dev,
+    //    .sig_ptr = (uintptr_t)&ctx->req_sig,
+    // };
+ 
+-   // *ctx_out = &ctx->base;
++   *ctx_out = &ctx->base;
+ 
+-   // return VK_SUCCESS;
+-
+-   printf("unimpl: nvkmd_nvgpu_create_bind_ctx\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   return VK_SUCCESS;
+ }
+ 
+ static void
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+index 51e62d10a4c..7b41f9e126c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+@@ -5,10 +5,19 @@
+ 
+ #include "nvkmd_nvgpu.h"
+ 
+-#include "nouveau_device.h"
+ #include "vk_log.h"
+ 
++#include <fcntl.h>
+ #include <xf86drm.h>
++#include "drm-uapi/nvgpu-as.h"
++#include "util/u_memory.h"
++#include "vulkan/vulkan_core.h"
++#include <sys/ioctl.h>
++
++#define NV_LINUX
++
++#include "drm-uapi/nvmap.h"
++#include "drm-uapi/nvgpu-ctrl.h"
+ 
+ VkResult
+ nvkmd_nvgpu_create_dev(struct nvkmd_pdev *_pdev,
+@@ -24,38 +33,104 @@ nvkmd_nvgpu_create_dev(struct nvkmd_pdev *_pdev,
+    dev->base.ops = &nvkmd_nvgpu_dev_ops;
+    dev->base.pdev = &pdev->base;
+    dev->base.va_start = 0;
+-   dev->base.va_end = NOUVEAU_WS_DEVICE_KERNEL_RESERVATION_START;
++   dev->base.va_end = NVKMD_NVGPU_REPLAY_HEAP_END;
++
++   dev->ctrl_fd = pdev->ctrl_fd;
++   dev->nvmap_fd = open("/dev/nvmap", O_RDWR | O_CLOEXEC);
++   // dev->modeset_fd = open("/dev/nvidia-modeset", O_RDWR | O_CLOEXEC);
++   // dev->host1x_fd = open("/dev/host1x-fence");
++   
++
++   struct nvmap_available_heaps heaps = {.heaps = 1345};
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_AVAILABLE_HEAPS, &heaps) == -1) {
++      printf("failed to NVMAP_IOC_GET_AVAILABLE_HEAPS %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
+ 
+-   list_inithead(&dev->base.mems);
+-   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++   // I don't think I need it at all
++   // struct NvKmsIoctlParams alloc_dev = {
++   //    .cmd = NVKMS_IOCTL_ALLOC_DEVICE,
++   //    .address = (NvU64)&alloc_dev_cmd,
++   //    .size = sizeof(alloc_dev_cmd),
++   // };
++   // if (ioctl(dev->modeset_fd, NVKMS_IOCTL_IOWR, &alloc_dev) == -1) {
++   //    printf("failed to NVKMS_IOCTL_ALLOC_DEVICE %d\n", errno);
++   //    // return VK_ERROR_UNKNOWN;
++   // }
+ 
+-   drmDevicePtr drm_device = NULL;
+-   int ret = drmGetDeviceFromDevId(pdev->base.drm.render_dev, 0, &drm_device);
+-   if (ret != 0) {
+-      FREE(dev);
+-      return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
+-                       "Failed to get DRM device: %m");
+-   }
++   // NVGPU_GPU_IOCTL_GET_TPC_MASKS // TODO
++   // NVGPU_GPU_IOCTL_GET_GPC_LOCAL_TO_PHYSICAL_MAP // TODO
++   // NVGPU_GPU_IOCTL_GET_GPC_LOCAL_TO_LOGICAL_MAP // TODO
++   // NVGPU_GPU_IOCTL_GET_FBP_L2_MASKS // TODO
++   
++
++   // list_inithead(&dev->base.mems);
++   // simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+ 
+-   // dev->ws_dev = nouveau_ws_device_new(drm_device);
+-   drmFreeDevice(&drm_device);
++   // drmDevicePtr drm_device = NULL;
++   // int ret = drmGetDeviceFromDevId(pdev->base.drm.render_dev, 0, &drm_device);
++   // if (ret != 0) {
++   //    FREE(dev);
++   //    return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++   //                     "Failed to get DRM device: %m");
++   // }
++
++   // dev->ws_dev = NVGPU_ws_device_new(drm_device);
++   // drmFreeDevice(&drm_device);
+    // if (dev->ws_dev == NULL) {
+    //    FREE(dev);
+    //    return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
+    //                     "Failed to get DRM device: %m");
+    // }
+ 
+-   // simple_mtx_init(&dev->heap_mutex, mtx_plain);
++   struct nvgpu_alloc_as_args args = {
++      .flags = NVGPU_GPU_IOCTL_ALLOC_AS_FLAGS_UNIFIED_VA,
++      .va_range_start = NVKMD_NVGPU_HEAP_START, // 0x0000000004000000,
++      .va_range_end   = NVKMD_NVGPU_HEAP_END, // 0x0000002000000000,
++   };
++   if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_ALLOC_AS, &args) == -1) {
++      printf("failed to NVGPU_GPU_IOCTL_ALLOC_AS %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
+ 
+-   // STATIC_ASSERT(NVKMD_NOUVEAU_HEAP_START < NVKMD_NOUVEAU_HEAP_END);
+-   // util_vma_heap_init(&dev->heap, NVKMD_NOUVEAU_HEAP_START,
+-   //                    NVKMD_NOUVEAU_HEAP_END - NVKMD_NOUVEAU_HEAP_START);
++   dev->heap_as_fd = args.as_fd;
+ 
+-   // STATIC_ASSERT(NVKMD_NOUVEAU_REPLAY_HEAP_START <
+-   //                  NVKMD_NOUVEAU_REPLAY_HEAP_END);
+-   // util_vma_heap_init(&dev->replay_heap,
+-   //    NVKMD_NOUVEAU_REPLAY_HEAP_START,
+-   //    NVKMD_NOUVEAU_REPLAY_HEAP_END - NVKMD_NOUVEAU_REPLAY_HEAP_START);
++   struct nvgpu_as_get_va_regions_args get_va_args = {};
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_GET_VA_REGIONS, &get_va_args) == -1) {
++      printf("failed to NVGPU_AS_IOCTL_GET_VA_REGIONS %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   dev->regions_size = get_va_args.buf_size;
++   dev->regions = CALLOC(get_va_args.buf_size, sizeof(struct nvgpu_as_va_region));
++   get_va_args.buf_addr = (__u64)dev->regions;
++
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_GET_VA_REGIONS, &get_va_args) == -1) {
++      printf("failed to NVGPU_AS_IOCTL_GET_VA_REGIONS %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   // still unsure what this is for...
++   // struct nvgpu_as_get_sync_ro_map_args get_sync_ro_args = {};
++   // if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_GET_SYNC_RO_MAP, &get_sync_ro_args) == -1) {
++   //    printf("failed to NVGPU_AS_IOCTL_GET_SYNC_RO_MAP %d\n", errno);
++   //    return VK_ERROR_UNKNOWN;
++   // }
++
++   // dev->next_syncpt = 0;
++   // dev->max_syncpts = get_sync_ro_args.num_syncpoints;
++
++   simple_mtx_init(&dev->heap_mutex, mtx_plain);
++
++   STATIC_ASSERT(NVKMD_NVGPU_HEAP_START < NVKMD_NVGPU_HEAP_END);
++   util_vma_heap_init(&dev->heap, NVKMD_NVGPU_HEAP_START,
++                      NVKMD_NVGPU_HEAP_END - NVKMD_NVGPU_HEAP_START);
++
++   STATIC_ASSERT(NVKMD_NVGPU_REPLAY_HEAP_START <
++                    NVKMD_NVGPU_REPLAY_HEAP_END);
++   util_vma_heap_init(&dev->replay_heap,
++      NVKMD_NVGPU_REPLAY_HEAP_START,
++      NVKMD_NVGPU_REPLAY_HEAP_END - NVKMD_NVGPU_REPLAY_HEAP_START);
+ 
+    *dev_out = &dev->base;
+ 
+@@ -67,16 +142,14 @@ nvkmd_nvgpu_dev_destroy(struct nvkmd_dev *_dev)
+ {
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+ 
+-   // nouveau_ws_device_destroy(dev->ws_dev);
++   // NVGPU_ws_device_destroy(dev->ws_dev);
+    FREE(dev);
+ }
+ 
+ static inline uint64_t
+ nvkmd_nvgpu_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+ {
+-   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+-
+-   // return nouveau_ws_device_timestamp(dev->ws_dev);
++   // return NVGPU_ws_device_timestamp(dev->ws_dev);
+    printf("umimpl: nvkmd_nvgpu_dev_get_gpu_timestamp\n");
+    return 0;
+ }
+@@ -84,11 +157,12 @@ nvkmd_nvgpu_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+ static int
+ nvkmd_nvgpu_dev_get_drm_fd(struct nvkmd_dev *_dev)
+ {
+-   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_dev->pdev);
+ 
+-   printf("umimpl: nvkmd_nvgpu_dev_get_drm_fd\n");
+-   return -1;
++   // printf("umimpl: nvkmd_nvgpu_dev_get_drm_fd\n");
++   return pdev->render_fd;
+    // return dev->ws_dev->fd;
++   // return -1;
+ }
+ 
+ const struct nvkmd_dev_ops nvkmd_nvgpu_dev_ops = {
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index fd0503fa2e3..5d9a57bd21b 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -8,9 +8,40 @@
+ #include "nouveau_bo.h"
+ #include "vk_log.h"
+ 
++#include "drm-uapi/nvgpu-ctrl.h"
++#include "drm-uapi/nvgpu-as.h"
++#include "drm-uapi/nvmap.h"
++#include "util/u_memory.h"
+ #include "vulkan/vulkan_core.h"
++#include <sys/ioctl.h>
+ #include <sys/mman.h>
+ 
++#define NVMAP_HEAP_IOVMM   (1ul<<30)
++
++#define NVMAP_HEAP_CARVEOUT_VPR     (1ul<<28)
++#define NVMAP_HEAP_CARVEOUT_TSEC    (1ul<<27)
++#define NVMAP_HEAP_CARVEOUT_VIDMEM  (1ul<<26)
++#define NVMAP_HEAP_CARVEOUT_GPU (1ul << 3)
++#define NVMAP_HEAP_CARVEOUT_FSI   (1ul<<2)
++#define NVMAP_HEAP_CARVEOUT_IVM     (1ul<<1)
++#define NVMAP_HEAP_CARVEOUT_GENERIC (1ul<<0)
++
++/* allocation flags */
++#define NVMAP_HANDLE_UNCACHEABLE     (0x0ul << 0)
++#define NVMAP_HANDLE_WRITE_COMBINE   (0x1ul << 0)
++#define NVMAP_HANDLE_INNER_CACHEABLE (0x2ul << 0)
++#define NVMAP_HANDLE_CACHEABLE       (0x3ul << 0)
++#define NVMAP_HANDLE_CACHE_FLAG      (0x3ul << 0)
++
++#define NVMAP_HANDLE_SECURE          (0x1ul << 2)
++#define NVMAP_HANDLE_KIND_SPECIFIED  (0x1ul << 3)
++#define NVMAP_HANDLE_COMPR_SPECIFIED (0x1ul << 4)
++#define NVMAP_HANDLE_ZEROED_PAGES    (0x1ul << 5)
++#define NVMAP_HANDLE_PHYS_CONTIG     (0x1ul << 6)
++#define NVMAP_HANDLE_CACHE_SYNC      (0x1ul << 7)
++#define NVMAP_HANDLE_CACHE_SYNC_AT_RESERVE      (0x1ul << 8)
++#define NVMAP_HANDLE_RO	             (0x1ul << 9)
++
+ VkResult
+ nvkmd_nvgpu_alloc_mem(struct nvkmd_dev *dev,
+                         struct vk_object_base *log_obj,
+@@ -27,51 +58,49 @@ static VkResult
+ create_mem_or_close_bo(struct nvkmd_nvgpu_dev *dev,
+                        struct vk_object_base *log_obj,
+                        enum nvkmd_mem_flags mem_flags,
+-                       struct nvgpu_ws_bo *bo,
++                       uint32_t nvmap_handle, uint64_t size_B,
+                        enum nvkmd_va_flags va_flags,
+                        uint8_t pte_kind, uint64_t va_align_B,
+                        struct nvkmd_mem **mem_out)
+ {
+-   printf("unimpl: create_mem_or_close_bo\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+-//    const uint64_t size_B = bo->size;
+-//    VkResult result;
+-
+-//    struct nvkmd_nvgpu_mem *mem = CALLOC_STRUCT(nvkmd_nvgpu_mem);
+-//    if (mem == NULL) {
+-//       result = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+-//       goto fail_bo;
+-//    }
+-
+-//    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nvgpu_mem_ops,
+-//                   mem_flags, size_B, dev->base.pdev->bind_align_B);
+-//    mem->bo = bo;
+-
+-//    result = nvkmd_dev_alloc_va(&dev->base, log_obj,
+-//                                va_flags, pte_kind,
+-//                                size_B, va_align_B,
+-//                                0 /* fixed_addr */,
+-//                                &mem->base.va);
+-//    if (result != VK_SUCCESS)
+-//       goto fail_mem;
+-
+-//    result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0 /* va_offset_B */,
+-//                               &mem->base, 0 /* mem_offset_B */, size_B);
+-//    if (result != VK_SUCCESS)
+-//       goto fail_va;
+-
+-//    *mem_out = &mem->base;
+-
+-//    return VK_SUCCESS;
+-
+-// fail_va:
+-//    nvkmd_va_free(mem->base.va);
+-// fail_mem:
+-//    FREE(mem);
+-// fail_bo:
+-//    nvgpu_ws_bo_destroy(bo);
+-
+-//    return result;
++   // const uint64_t size_B = bo->size;
++   VkResult result;
++
++   struct nvkmd_nvgpu_mem *mem = CALLOC_STRUCT(nvkmd_nvgpu_mem);
++   if (mem == NULL) {
++      result = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++      goto fail_bo;
++   }
++
++   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nvgpu_mem_ops,
++                  mem_flags, size_B, dev->base.pdev->bind_align_B);
++   mem->nvmap_handle = nvmap_handle;
++
++   result = nvkmd_dev_alloc_va(&dev->base, log_obj,
++                               va_flags, pte_kind,
++                               size_B, va_align_B,
++                               0 /* fixed_addr */,
++                               &mem->base.va);
++   if (result != VK_SUCCESS)
++      goto fail_mem;
++
++   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0 /* va_offset_B */,
++                              &mem->base, 0 /* mem_offset_B */, size_B);
++   if (result != VK_SUCCESS)
++      goto fail_va;
++
++   *mem_out = &mem->base;
++
++   return VK_SUCCESS;
++
++fail_va:
++   nvkmd_va_free(mem->base.va);
++fail_mem:
++   FREE(mem);
++fail_bo:
++   // nvgpu_ws_bo_destroy(bo); xxx: free!!
++
++   return result;
+ }
+ 
+ VkResult
+@@ -82,26 +111,86 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+                               enum nvkmd_mem_flags flags,
+                               struct nvkmd_mem **mem_out)
+ {
+-   printf("unimpl: nvkmd_nvgpu_alloc_tiled_mem\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+-   // const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
+-
+-   // /* Only one placement flag may be specified */
+-   // assert(util_bitcount(flags & (NVKMD_MEM_LOCAL |
+-   //                               NVKMD_MEM_GART |
+-   //                               NVKMD_MEM_VRAM)) == 1);
+-   // enum nvgpu_ws_bo_flags domains = 0;
+-   // if (flags & NVKMD_MEM_LOCAL) {
+-   //    domains |= nvgpu_WS_BO_GART;
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
++
++   /* Only one placement flag may be specified */
++   assert(util_bitcount(flags & (NVKMD_MEM_LOCAL |
++                                 NVKMD_MEM_GART |
++                                 NVKMD_MEM_VRAM)) == 1);
++
++   if (tile_mode != 0) {
++      printf("unimpl tile mode=%d\n", tile_mode);
++   }
++
++                                 // XXX: i think this was wrong
++   // void* addr = mmap(NULL, size_B, PROT_READ|PROT_WRITE, MAP_SHARED, dev->ctrl_fd, 0);
++   // if (addr == NULL) {
++   //    return VK_ERROR_OUT_OF_HOST_MEMORY;
++   // }
++
++   const uint32_t mem_align_B = _dev->pdev->bind_align_B;
++   size_B = align64(size_B, mem_align_B);
++
++   assert(util_is_power_of_two_or_zero64(align_B));
++   const uint64_t va_align_B = MAX2(mem_align_B, align_B);
++
++   struct nvmap_create_handle create_args = {
++      .size = size_B,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_CREATE, &create_args) == -1) {
++      printf("filed to NVMAP_IOC_CREATE: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   uint32_t handle = create_args.handle;
++
++   uint32_t heap_mask = 0;
++   // if (flags & NVKMD_MEM_LOCAL) { xxx
++   //    heap_mask |= NVMAP_HEAP_CARVEOUT_GENERIC;
+    //    if (dev_info->vram_size_B > 0)
+-   //       domains |= nvgpu_WS_BO_VRAM;
++   //       heap_mask |= NVMAP_HEAP_CARVEOUT_GPU;
+    // } else if (flags & NVKMD_MEM_GART) {
+-   //    domains |= nvgpu_WS_BO_GART;
++   //    heap_mask |= NVMAP_HEAP_CARVEOUT_GENERIC; // xxx
+    // } else if (flags & NVKMD_MEM_VRAM) {
+-   //    domains |= nvgpu_WS_BO_VRAM;
++   //    heap_mask |= NVMAP_HEAP_CARVEOUT_GPU;
+    // }
+ 
++   heap_mask = NVMAP_HEAP_IOVMM;
++
++   // 1002 is the memory tag. this is what nvidia gives it, shurg
++   uint32_t alloc_flags = (0x1002 << 16) | NVMAP_HANDLE_CACHEABLE; // xxx
++
++   struct nvmap_alloc_handle alloc_args = {
++      .handle = handle,
++      .heap_mask = heap_mask,
++      .flags = alloc_flags,
++      .align = va_align_B,
++      .numa_nid = -1,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_ALLOC, &alloc_args) == -1) {
++      printf("failed to NVMAP_IOC_ALLOC: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   struct nvmap_create_handle get_fd_args = {
++      .handle = handle,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
++      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   struct nvgpu_gpu_register_buffer_args register_args = {
++      .dmabuf_fd = get_fd_args.fd,
++   };
++   if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_REGISTER_BUFFER, &register_args) == -1) {
++      printf("failed to NVGPU_GPU_IOCTL_REGISTER_BUFFER: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++   close(get_fd_args.fd);
++
++
+    // if (dev->base.pdev->debug_flags & NVK_DEBUG_FORCE_GART)
+    //    domains = nvgpu_WS_BO_GART;
+ 
+@@ -117,12 +206,6 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    //    domains = nvgpu_WS_BO_GART;
+    // }
+ 
+-   // const uint32_t mem_align_B = _dev->pdev->bind_align_B;
+-   // size_B = align64(size_B, mem_align_B);
+-
+-   // assert(util_is_power_of_two_or_zero64(align_B));
+-   // const uint64_t va_align_B = MAX2(mem_align_B, align_B);
+-
+    // enum nvgpu_ws_bo_flags nvgpu_flags = domains;
+    // if (flags & NVKMD_MEM_CAN_MAP)
+    //    nvgpu_flags |= nvgpu_WS_BO_MAP;
+@@ -136,13 +219,15 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    // if (bo == NULL)
+    //    return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
+ 
+-   // enum nvkmd_va_flags va_flags = 0;
++   enum nvkmd_va_flags va_flags = 0; // XXX
+    // if (domains == nvgpu_WS_BO_GART)
+    //    va_flags |= NVKMD_VA_GART;
+ 
+-   // return create_mem_or_close_bo(dev, log_obj, flags, bo,
+-   //                               va_flags, pte_kind, va_align_B,
+-   //                               mem_out);
++   flags |= NVKMD_MEM_COHERENT; // we allocate everything as coherent
++
++   return create_mem_or_close_bo(dev, log_obj, flags, handle, size_B,
++                                 va_flags, pte_kind, va_align_B,
++                                 mem_out);
+ }
+ 
+ VkResult
+@@ -180,12 +265,20 @@ nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *_dev,
+ static void
+ nvkmd_nvgpu_mem_free(struct nvkmd_mem *_mem)
+ {
+-   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(mem->base.dev);
++
++   nvkmd_va_free(mem->base.va);
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, &mem->nvmap_handle) == -1) {
++      printf("failed NVMAP_IOC_FREE: %d\n", errno);
++   }
++
++
++   // printf("unimpl: mem_free\n");
+ 
+-   // nvkmd_va_free(mem->base.va);
+    // nvgpu_ws_bo_destroy(mem->bo);
+    // FREE(mem);
+-   printf("unimpl: nvkmd_nvgpu_mem_free\n");
++
+ }
+ 
+ static VkResult
+@@ -195,29 +288,38 @@ nvkmd_nvgpu_mem_map(struct nvkmd_mem *_mem,
+                       void *fixed_addr,
+                       void **map_out)
+ {
+-   printf("unimpl: nvkmd_nvgpu_mem_map\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+-   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
++   struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
+ 
+-   // int prot = 0;
+-   // if (map_flags & NVKMD_MEM_MAP_RD)
+-   //    prot |= PROT_READ;
+-   // if (map_flags & NVKMD_MEM_MAP_WR)
+-   //    prot |= PROT_WRITE;
++   struct nvmap_create_handle get_fd_args = {
++      .handle = mem->nvmap_handle,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
++      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
+ 
+-   // int flags = MAP_SHARED;
+-   // if (map_flags & NVKMD_MEM_MAP_FIXED)
+-   //    flags |= MAP_FIXED;
++   int prot = 0;
++   if (map_flags & NVKMD_MEM_MAP_RD)
++      prot |= PROT_READ;
++   if (map_flags & NVKMD_MEM_MAP_WR)
++      prot |= PROT_WRITE;
+ 
+-   // void *map = mmap(fixed_addr, mem->base.size_B, prot, flags,
+-   //                  dev->ws_dev->fd, mem->bo->map_handle);
+-   // if (map == MAP_FAILED)
+-   //    return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++   int flags = MAP_SHARED;
++   if (map_flags & NVKMD_MEM_MAP_FIXED)
++      flags |= MAP_FIXED;
+ 
+-   // *map_out = map;
++   void *map = mmap(fixed_addr, mem->base.size_B, prot, flags,
++                    get_fd_args.fd, 0);
+ 
+-   // return VK_SUCCESS;
++   close(get_fd_args.fd);
++
++   if (map == MAP_FAILED)
++      return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++
++   *map_out = map;
++
++   return VK_SUCCESS;
+ }
+ 
+ static void
+@@ -225,10 +327,9 @@ nvkmd_nvgpu_mem_unmap(struct nvkmd_mem *_mem,
+                         enum nvkmd_mem_map_flags flags,
+                         void *map)
+ {
+-   printf("unimpl: nvkmd_nvgpu_mem_unmap\n");
+-   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+ 
+-   // munmap(map, mem->base.size_B);
++   munmap(map, mem->base.size_B);
+ }
+ 
+ static VkResult
+@@ -237,6 +338,7 @@ nvkmd_nvgpu_mem_overmap(struct nvkmd_mem *_mem,
+                           enum nvkmd_mem_map_flags flags,
+                           void *map)
+ {
++   assert(false);
+    printf("unimpl: nvkmd_nvgpu_mem_overmap\n");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+    // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+@@ -258,24 +360,26 @@ nvkmd_nvgpu_mem_export_dma_buf(struct nvkmd_mem *_mem,
+                                  struct vk_object_base *log_obj,
+                                  int *fd_out)
+ {
+-   printf("unimpl: nvkmd_nvgpu_mem_export_dma_buf\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+-   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
+ 
+-   // int err = nvgpu_ws_bo_dma_buf(mem->bo, fd_out);
+-   // if (err)
+-   //    return vk_errorf(log_obj, VK_ERROR_TOO_MANY_OBJECTS,
+-   //                     "Failed to export dma-buf: %m");
++   struct nvmap_create_handle get_fd_args = {
++      .handle = mem->nvmap_handle,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
++      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
+ 
+-   // return VK_SUCCESS;
++   *fd_out = get_fd_args.fd;
++
++   return VK_SUCCESS;
+ }
+ 
+ static uint32_t
+ nvkmd_nvgpu_mem_log_handle(struct nvkmd_mem *_mem)
+ {
+-   printf("unimpl: nvkmd_nvgpu_mem_log_handle\n");
+-   return 0;
+-   // return nvkmd_nvgpu_mem(_mem)->bo->handle;
++   return nvkmd_nvgpu_mem(_mem)->nvmap_handle;
+ }
+ 
+ const struct nvkmd_mem_ops nvkmd_nvgpu_mem_ops = {
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index a10a074af97..62b2438da53 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -6,14 +6,19 @@
+ #include "nvkmd_nvgpu.h"
+ 
+ #include "nouveau_device.h"
++#include "nvkmd/nvkmd.h"
+ #include "util/os_misc.h"
++#include "util/cache_ops.h"
+ #include "vk_log.h"
+ 
+ #include <fcntl.h>
+ #include <string.h>
++#include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <xf86drm.h>
+ 
++#include "drm-uapi/nvgpu-ctrl.h"
++
+ static bool
+ drm_device_is_tegra(const char *path)
+ {
+@@ -35,6 +40,114 @@ drm_device_is_tegra(const char *path)
+    return is_nouveau;
+ }
+ 
++static uint8_t
++max_warps_per_mp_for_sm(uint8_t sm)
++{
++   switch (sm) {
++   case 10:
++   case 11:
++      return 24;
++   case 12:
++   case 13:
++   case 75:
++      return 32;
++   case 20:
++   case 21:
++   case 86:
++   case 87:
++   case 89:
++      return 48;
++   case 30:
++   case 32:
++   case 35:
++   case 37:
++   case 50:
++   case 52:
++   case 53:
++   case 60:
++   case 61:
++   case 62:
++   case 70:
++   case 72:
++   case 80:
++   case 90:
++      return 64;
++   default:
++      assert(!"unkown SM version");
++      // return the biggest known value
++      return 64;
++   }
++}
++
++static uint8_t
++sm_for_chipset(uint16_t chipset)
++{
++   if (chipset >= 0x190)
++      return 89;
++   // GH100 is older than AD10X, but is SM90
++   else if (chipset >= 0x180)
++      return 90;
++   else if (chipset == 0x17b)
++      return 87;
++   else if (chipset >= 0x172)
++      return 86;
++   else if (chipset >= 0x170)
++      return 80;
++   else if (chipset >= 0x160)
++      return 75;
++   else if (chipset >= 0x14b)
++      return 72;
++   else if (chipset >= 0x140)
++      return 70;
++   else if (chipset >= 0x13b)
++      return 62;
++   else if (chipset >= 0x132)
++      return 61;
++   else if (chipset >= 0x130)
++      return 60;
++   else if (chipset >= 0x12b)
++      return 53;
++   else if (chipset >= 0x120)
++      return 52;
++   else if (chipset >= 0x110)
++      return 50;
++   // TODO: 37
++   else if (chipset >= 0x0f0)
++      return 35;
++   else if (chipset >= 0x0ea)
++      return 32;
++   else if (chipset >= 0x0e0)
++      return 30;
++   // GF110 is SM20
++   else if (chipset == 0x0c8)
++      return 20;
++   else if (chipset >= 0x0c1)
++      return 21;
++   else if (chipset >= 0x0c0)
++      return 20;
++   else if (chipset >= 0x0a3)
++      return 12;
++   // GT200 is SM13
++   else if (chipset >= 0x0a0)
++      return 13;
++   else if (chipset >= 0x080)
++      return 11;
++   // this has to be == because 0x63 is older than 0x50 and has no compute
++   else if (chipset == 0x050)
++      return 10;
++   // no compute
++   return 0x00;
++}
++
++static uint8_t
++mp_per_tpc_for_chipset(uint16_t chipset)
++{
++   // GP100 is special and has two, otherwise it's a Volta and newer thing to have two
++   if (chipset == 0x130 || chipset >= 0x140)
++      return 2;
++   return 1;
++}
++
+ VkResult
+ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+                               struct vk_object_base *log_obj,
+@@ -45,7 +158,7 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ 
+    switch (drm_device->bustype) {
+-   case DRM_BUS_PLATFORM: {
++   case DRM_BUS_HOST1X: {
+       const char *compat_prefix = "nvidia,";
+       bool found = false;
+       for (int i = 0; drm_device->deviceinfo.platform->compatible[i] != NULL; i++) {
+@@ -66,7 +179,7 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+    if (!drm_device_is_tegra(drm_device->nodes[DRM_NODE_RENDER]))
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ 
+-//    struct nouveau_ws_device *ws_dev = nouveau_ws_device_new(drm_device);
++   // struct nouveau_ws_device *ws_dev = nouveau_ws_device_new(drm_device);
+ //    if (!ws_dev)
+ //       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ 
+@@ -76,14 +189,13 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+ //       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ //    }
+ 
+-//    struct stat st;
+-//    if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
+-//       nouveau_ws_device_destroy(ws_dev);
+-//       return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
+-//                        "fstat() failed on %s: %m",
+-//                        drm_device->nodes[DRM_NODE_RENDER]);
+-//    }
+-//    const dev_t render_dev = st.st_rdev;
++   struct stat st;
++   if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
++      // nouveau_ws_device_destroy(ws_dev);
++      return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                       "fstat() failed on %s: %m",
++                       drm_device->nodes[DRM_NODE_RENDER]);
++   }
+ 
+    struct nvkmd_nvgpu_pdev *pdev = CALLOC_STRUCT(nvkmd_nvgpu_pdev);
+    if (pdev == NULL) {
+@@ -91,39 +203,69 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
++   pdev->ctrl_fd = open("/dev/nvgpu/igpu0/ctrl", O_RDWR | O_CLOEXEC);
++
++   struct nvgpu_gpu_characteristics chars  = {};
++   struct nvgpu_gpu_get_characteristics chars_get = {
++      .gpu_characteristics_buf_addr = (__u64)&chars,
++      .gpu_characteristics_buf_size = sizeof(chars),
++   };
++   if (ioctl(pdev->ctrl_fd, NVGPU_GPU_IOCTL_GET_CHARACTERISTICS, &chars_get) == -1) {
++      printf("failed to NVGPU_GPU_IOCTL_GET_CHARACTERISTICS %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
+    pdev->base.ops = &nvkmd_nvgpu_pdev_ops;
+    pdev->base.debug_flags = debug_flags;
+-//    pdev->base.dev_info = ws_dev->info;
+-//    pdev->base.kmd_info = (struct nvkmd_info) {
+-//       .has_dma_buf = true,
+-//       .has_get_vram_used = nouveau_ws_device_vram_used(ws_dev) != 0,
+-//       .has_alloc_tiled = nouveau_ws_device_has_tiled_bo(ws_dev),
+-//       .has_map_fixed = true,
+-//       .has_overmap = true,
+-//    };
+-
+-//    /* Nouveau uses the OS page size for all pages, regardless of whether they
+-//     * come from VRAM or system RAM.
+-//     */
+-//    uint64_t os_page_size;
+-//    os_get_page_size(&os_page_size);
+-//    assert(os_page_size <= UINT32_MAX);
+-//    pdev->base.bind_align_B = os_page_size;
++   pdev->base.dev_info = (struct nv_device_info) {
++    .type = NV_DEVICE_TYPE_SOC,
++    .device_name = "NVIDIA Tegra Orin",
++    .sm = sm_for_chipset(chars.arch),
++    .chipset = chars.arch,
++    .gpc_count = chars.num_gpc,
++    .tpc_count = chars.num_tpc_per_gpc * chars.num_gpc,
++    .mp_per_tpc = mp_per_tpc_for_chipset(chars.arch),
++    .max_warps_per_mp = max_warps_per_mp_for_sm(sm_for_chipset(chars.arch)),
++    .cls_copy    = chars.dma_copy_class,
++    .cls_eng2d   = chars.twod_class,
++    .cls_eng3d   = chars.threed_class,
++    .cls_m2mf    = chars.inline_to_memory_class,
++    .cls_compute = chars.compute_class,
++    .vram_size_B = chars.on_board_video_memory_size,
++    .nc_atom_size_B = util_cache_granularity(),
++   };
++
++   strncpy(pdev->base.dev_info.chipset_name, (const char*)&chars.chipname[0], sizeof(pdev->base.dev_info.chipset_name));
++
++
++   pdev->base.kmd_info = (struct nvkmd_info) {
++      .has_dma_buf = true,
++      // .has_get_vram_used = nouveau_ws_device_vram_used(ws_dev) != 0,
++      .has_alloc_tiled = true,// nouveau_ws_device_has_tiled_bo(ws_dev),
++      .has_map_fixed = true,
++      .has_overmap = true,
++   };
++
++   // XXX is this correct?
++   uint64_t os_page_size;
++   os_get_page_size(&os_page_size);
++   assert(os_page_size <= UINT32_MAX);
++   pdev->base.bind_align_B = os_page_size;
+ 
+ //    pdev->base.drm.render_dev = render_dev;
+ 
+-//    /* DRM primary is optional */
+-//    if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+-//        !stat(drm_device->nodes[DRM_NODE_PRIMARY], &st))
+-//       pdev->base.drm.primary_dev = st.st_rdev;
++   /* DRM primary is optional */
++   if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++       !stat(drm_device->nodes[DRM_NODE_PRIMARY], &st))
++      pdev->base.drm.primary_dev = st.st_rdev;
+ 
+-//    pdev->primary_fd = -1;
+-//    pdev->ws_dev = ws_dev;
++   pdev->primary_fd = -1;
++   pdev->render_fd = open(drm_device->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+ 
+-//    pdev->syncobj_sync_type = vk_drm_syncobj_get_type(ws_dev->fd);
+-//    pdev->sync_types[0] = &pdev->syncobj_sync_type;
+-//    pdev->sync_types[1] = NULL;
+-//    pdev->base.sync_types = pdev->sync_types;
++   pdev->syncobj_sync_type = nvkmd_nvgpu_sync_get_type(pdev);
++   pdev->sync_types[0] = &pdev->syncobj_sync_type;
++   pdev->sync_types[1] = NULL;
++   pdev->base.sync_types = pdev->sync_types;
+ 
+    *pdev_out = &pdev->base;
+ 
+@@ -145,9 +287,6 @@ nvkmd_nvgpu_pdev_destroy(struct nvkmd_pdev *_pdev)
+ static uint64_t
+ nvkmd_nvgpu_pdev_get_vram_used(struct nvkmd_pdev *_pdev)
+ {
+-   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
+-
+-//    return nouveau_ws_device__used(pdev->ws_dev);
+       printf("unimpl: nvkmd_nvgpu_pdev_get_vram_used\n");
+       return 0;
+ }
+@@ -155,29 +294,25 @@ nvkmd_nvgpu_pdev_get_vram_used(struct nvkmd_pdev *_pdev)
+ static int
+ nvkmd_nvgpu_pdev_get_drm_primary_fd(struct nvkmd_pdev *_pdev)
+ {
+-    struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
+-    printf("unimpl: nvkmd_nvgpu_pdev_get_drm_primary_fd\n");
+-    return -1;
+-
+-//    if (pdev->primary_fd >= 0)
+-//       return pdev->primary_fd;
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
+ 
+-//    if (pdev->base.drm.primary_dev == 0)
+-//       return -1;
++   if (pdev->primary_fd >= 0)
++      return pdev->primary_fd;
+ 
+-//    drmDevicePtr drm_device = NULL;
+-//    int ret = drmGetDeviceFromDevId(pdev->base.drm.primary_dev, 0, &drm_device);
+-//    if (ret != 0)
+-//       return -1;
++   if (pdev->base.drm.primary_dev == 0)
++      return -1;
+ 
+-//    int fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+-//    drmFreeDevice(&drm_device);
++   drmDevicePtr drm_device = NULL;
++   int ret = drmGetDeviceFromDevId(pdev->base.drm.primary_dev, 0, &drm_device);
++   if (ret != 0)
++      return -1;
+ 
+-//    /* TODO: Test if the FD is usable? */
++   int fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
++   drmFreeDevice(&drm_device);
+ 
+-//    pdev->primary_fd = fd;
++   pdev->primary_fd = fd;
+ 
+-//    return pdev->primary_fd;
++   return pdev->primary_fd;
+ }
+ 
+ const struct nvkmd_pdev_ops nvkmd_nvgpu_pdev_ops = {
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+new file mode 100644
+index 00000000000..062bbadb46d
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+@@ -0,0 +1,201 @@
++#include "nvk_device.h"
++#include "nvkmd_nvgpu.h"
++
++#include "vk_log.h"
++#include "vk_sync.h"
++
++#include "drm-uapi/tegra_drm.h"
++#include <vulkan/vulkan_core.h>
++
++static VkResult
++nvkmd_nvgpu_sync_get_value(struct vk_device *device,
++                         struct vk_sync *sync,
++                         uint64_t *value);
++
++static VkResult
++nvkmd_nvgpu_sync_init(struct vk_device *device,
++                    struct vk_sync *sync,
++                    uint64_t initial_value)
++{
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++
++   sobj->local_offset = initial_value;
++
++   return VK_SUCCESS;
++}
++
++void
++nvkmd_nvgpu_sync_finish(struct vk_device *device,
++                      struct vk_sync *sync)
++{
++}
++
++static VkResult
++nvkmd_nvgpu_sync_signal(struct vk_device *device,
++                      struct vk_sync *sync,
++                      uint64_t value)
++{
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++   struct nvk_device *nvk_dev = container_of(device, struct nvk_device, vk);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(nvk_dev->nvkmd);
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(dev->base.pdev);
++
++   if (!sobj->initialized) {
++      return VK_SUCCESS;
++   }
++
++   uint64_t cur_value;
++   nvkmd_nvgpu_sync_get_value(device, sync, &cur_value);
++   assert(cur_value + 1 == value);
++
++   struct drm_tegra_syncpt_incr incr_args = {
++      .id = sobj->syncpoint_id,
++   };
++   if (ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPT_INCR, &incr_args) == -1) {
++      printf("failed DRM_IOCTL_TEGRA_SYNCPT_INCR: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_sync_get_value(struct vk_device *device,
++                         struct vk_sync *sync,
++                         uint64_t *value)
++{
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++   struct nvk_device *nvk_dev = container_of(device, struct nvk_device, vk);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(nvk_dev->nvkmd);
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(dev->base.pdev);
++
++   if (!sobj->initialized) {
++      *value = 0;
++      return VK_SUCCESS; // is this correct?
++   }
++
++   struct drm_tegra_syncpt_read read_args = {
++      .id = sobj->syncpoint_id,
++   };
++   if (ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPT_READ, &read_args) == -1) {
++      printf("failed DRM_IOCTL_TEGRA_SYNCPT_READ: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   *value = read_args.value + sobj->local_offset;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_sync_reset(struct vk_device *device,
++                     struct vk_sync *sync)
++{
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++
++   sobj->initialized = false;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_sync_wait_many(struct vk_device *device,
++                         uint32_t wait_count,
++                         const struct vk_sync_wait *waits,
++                         enum vk_sync_wait_flags wait_flags,
++                         uint64_t abs_timeout_ns)
++{
++   struct nvk_device *nvk_dev = container_of(device, struct nvk_device, vk);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(nvk_dev->nvkmd);
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(dev->base.pdev);
++
++   // TODO: improve timeout case?
++
++   for (int i = 0; i < wait_count; ++i) {
++      struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(waits[i].sync);
++
++      if (!sobj->initialized) {
++         continue; // no work is pending on this syncpoint. XXX this is not actually correct; things can trigger sync other than GPU work!
++      }
++
++      // if (sobj->base.flags & VK_SYNC_IS_TIMELINE && waits[i].wait_value <= sobj->local_offset) {
++      //    continue; // already finished??
++      // }
++
++      uint64_t cur_val;
++      nvkmd_nvgpu_sync_get_value(device, waits[i].sync, &cur_val);
++
++      // printf("(vk=%p nv=%d) currently am %lu, waiting until %lu (off=%ld)\n", waits[i].sync, sobj->syncpoint_id, cur_val - sobj->local_offset, waits[i].wait_value - sobj->local_offset, sobj->local_offset);
++
++      if (cur_val >= waits[i].wait_value) {
++         continue; // already finished??
++      }
++
++      struct drm_tegra_syncpoint_wait wait_arg = {
++         .timeout_ns = abs_timeout_ns,
++         .id = sobj->syncpoint_id,
++         .threshold = waits[i].wait_value - sobj->local_offset,
++      };
++      if (nvgpu_ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait_arg) == -1) {
++         printf("wait: failed to DRM_IOCTL_TEGRA_SYNCPOINT_WAIT: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
++
++      sobj->initialized = false; // reset
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_sync_import_opaque_fd(struct vk_device *device,
++                                struct vk_sync *sync,
++                                int fd)
++{
++   return vk_errorf(device, VK_ERROR_UNKNOWN,
++                    "sync_import_opaque_fd: not implemented");
++}
++
++static VkResult
++nvkmd_nvgpu_sync_export_opaque_fd(struct vk_device *device,
++                                struct vk_sync *sync,
++                                int *fd)
++{
++   return vk_errorf(device, VK_ERROR_UNKNOWN,
++                    "sync_export_opaque_fd: not implemented");
++}
++
++static VkResult
++nvkmd_nvgpu_sync_move(struct vk_device *device,
++                    struct vk_sync *dst,
++                    struct vk_sync *src)
++{
++   return vk_errorf(device, VK_ERROR_UNKNOWN,
++                    "nvkmd_nvgpu_sync_move: not implemented");
++}
++
++
++struct vk_sync_type
++nvkmd_nvgpu_sync_get_type(struct nvkmd_nvgpu_pdev *pdev)
++{
++   struct vk_sync_type type = {
++      .size = sizeof(struct nvkmd_nvgpu_sync),
++      .features = VK_SYNC_FEATURE_BINARY |
++                  VK_SYNC_FEATURE_GPU_WAIT |
++                  VK_SYNC_FEATURE_CPU_RESET |
++                  VK_SYNC_FEATURE_CPU_SIGNAL |
++                  VK_SYNC_FEATURE_WAIT_PENDING |
++                  VK_SYNC_FEATURE_CPU_WAIT |
++                  VK_SYNC_FEATURE_TIMELINE,
++      .init = nvkmd_nvgpu_sync_init,
++      .finish = nvkmd_nvgpu_sync_finish,
++      .signal = nvkmd_nvgpu_sync_signal,
++      .get_value = nvkmd_nvgpu_sync_get_value,
++      .reset = nvkmd_nvgpu_sync_reset,
++      .move = nvkmd_nvgpu_sync_move,
++      .wait_many = nvkmd_nvgpu_sync_wait_many,
++      .import_opaque_fd = nvkmd_nvgpu_sync_import_opaque_fd,
++      .export_opaque_fd = nvkmd_nvgpu_sync_export_opaque_fd,
++   };
++   return type;
++}
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index a15826e1e01..fba8a0bddf8 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -6,93 +6,46 @@
+ #include "nvkmd_nvgpu.h"
+ 
+ #include "nouveau_bo.h"
++#include "drm-uapi/nvgpu-as.h"
++#include "drm-uapi/nvgpu-ctrl.h"
++#include "drm-uapi/nvmap.h"
++#include "nvkmd/nvkmd.h"
+ #include "util/bitscan.h"
++#include "vulkan/vulkan_core.h"
++#include <sys/ioctl.h>
+ #include "vk_log.h"
+ 
+ #include <inttypes.h>
+ #include <stdio.h>
+ #include <xf86drm.h>
+ 
+-// static VkResult MUST_CHECK
+-// alloc_heap_addr_locked(struct nvkmd_nvgpu_dev *dev,
+-//                        struct vk_object_base *log_obj,
+-//                        enum nvkmd_va_flags flags,
+-//                        uint64_t size_B, uint64_t align_B,
+-//                        uint64_t fixed_addr, uint64_t *addr_out)
+-// {
+-//    if (flags & NVKMD_VA_ALLOC_FIXED) {
+-//       assert(flags & NVKMD_VA_REPLAY);
+-//       if (fixed_addr < NVKMD_nvgpu_REPLAY_HEAP_START ||
+-//           fixed_addr >= NVKMD_nvgpu_REPLAY_HEAP_END) {
+-//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+-//                           "Capture address 0x%" PRIx64 " not in the reaplay "
+-//                           "heap address range [0x%" PRIx64 ", 0x%" PRIx64 ")",
+-//                           fixed_addr, NVKMD_nvgpu_REPLAY_HEAP_START,
+-//                           NVKMD_nvgpu_REPLAY_HEAP_END);
+-//       }
+-
+-//       if (fixed_addr & (align_B - 1)) {
+-//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+-//                           "Unaligned capture address: 0x%" PRIx64, fixed_addr);
+-//       }
+-
+-//       if (!util_vma_heap_alloc_addr(&dev->replay_heap, fixed_addr, size_B)) {
+-//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+-//                           "Replay address collision: 0x%" PRIx64, fixed_addr);
+-//       }
+-
+-//       *addr_out = fixed_addr;
+-//    } else if (flags & NVKMD_VA_REPLAY) {
+-//       *addr_out = util_vma_heap_alloc(&dev->replay_heap, size_B, align_B);
+-//       if (*addr_out == 0)
+-//          return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-//                           "Failed to allocate virtual address range");
+-//    } else {
+-//       *addr_out = util_vma_heap_alloc(&dev->heap, size_B, align_B);
+-//       if (*addr_out == 0)
+-//          return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-//                           "Failed to allocate virtual address range");
+-//    }
+-
+-//    return VK_SUCCESS;
+-// }
+-
+-// static VkResult MUST_CHECK
+-// alloc_heap_addr(struct nvkmd_nvgpu_dev *dev,
+-//                 struct vk_object_base *log_obj,
+-//                 enum nvkmd_va_flags flags,
+-//                 uint64_t size_B, uint64_t align_B,
+-//                 uint64_t fixed_addr, uint64_t *addr_out)
+-// {
+-//    simple_mtx_lock(&dev->heap_mutex);
+-//    VkResult result = alloc_heap_addr_locked(dev, log_obj, flags,
+-//                                             size_B, align_B,
+-//                                             fixed_addr, addr_out);
+-//    simple_mtx_unlock(&dev->heap_mutex);
+-//    return result;
+-// }
+-
+-// static void
+-// free_heap_addr(struct nvkmd_nvgpu_dev *dev,
+-//                enum nvkmd_va_flags flags,
+-//                uint64_t addr, uint64_t size_B)
+-// {
+-//    simple_mtx_lock(&dev->heap_mutex);
+-//    if (flags & NVKMD_VA_REPLAY) {
+-//       assert(addr >= NVKMD_nvgpu_REPLAY_HEAP_START);
+-//       assert(addr <= NVKMD_nvgpu_REPLAY_HEAP_END);
+-//       assert(addr + size_B <= NVKMD_nvgpu_REPLAY_HEAP_END);
+-
+-//       util_vma_heap_free(&dev->replay_heap, addr, size_B);
+-//    } else {
+-//       assert(addr >= NVKMD_nvgpu_HEAP_START);
+-//       assert(addr <= NVKMD_nvgpu_HEAP_END);
+-//       assert(addr + size_B <= NVKMD_nvgpu_HEAP_END);
+-
+-//       util_vma_heap_free(&dev->heap, addr, size_B);
+-//    }
+-//    simple_mtx_unlock(&dev->heap_mutex);
+-// }
++static VkResult
++nvkmd_nvgpu_va_unbind(struct nvkmd_va *_va,
++                        struct vk_object_base *log_obj,
++                        uint64_t va_offset_B,
++                        uint64_t range_B);
++
++static void
++free_heap_addr(struct nvkmd_nvgpu_dev *dev,
++               enum nvkmd_va_flags flags,
++               uint64_t addr, uint64_t size_B)
++{
++   simple_mtx_lock(&dev->heap_mutex);
++   if (flags & NVKMD_VA_REPLAY) {
++      assert(addr >= NVKMD_NVGPU_REPLAY_HEAP_START);
++      assert(addr <= NVKMD_NVGPU_REPLAY_HEAP_END);
++      assert(addr + size_B <= NVKMD_NVGPU_REPLAY_HEAP_END);
++
++      util_vma_heap_free(&dev->replay_heap, addr, size_B);
++   } else {
++      assert(addr >= NVKMD_NVGPU_HEAP_START);
++      assert(addr <= NVKMD_NVGPU_HEAP_END);
++      assert(addr + size_B <= NVKMD_NVGPU_HEAP_END);
++
++      util_vma_heap_free(&dev->heap, addr, size_B);
++   }
++   simple_mtx_unlock(&dev->heap_mutex);
++}
+ 
+ static VkResult MUST_CHECK
+ vm_bind(struct nvkmd_nvgpu_dev *dev,
+@@ -114,6 +67,65 @@ vm_bind(struct nvkmd_nvgpu_dev *dev,
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+ }
+ 
++static VkResult MUST_CHECK
++alloc_heap_addr_locked(struct nvkmd_nvgpu_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_va_flags flags,
++                       uint64_t size_B, uint64_t align_B,
++                       uint64_t fixed_addr, uint64_t *addr_out)
++{
++   if (flags & NVKMD_VA_ALLOC_FIXED) {
++      assert(flags & NVKMD_VA_REPLAY);
++      if (fixed_addr < NVKMD_NVGPU_REPLAY_HEAP_START ||
++          fixed_addr >= NVKMD_NVGPU_REPLAY_HEAP_END) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Capture address 0x%" PRIx64 " not in the reaplay "
++                          "heap address range [0x%" PRIx64 ", 0x%" PRIx64 ")",
++                          fixed_addr, NVKMD_NVGPU_REPLAY_HEAP_START,
++                          NVKMD_NVGPU_REPLAY_HEAP_END);
++      }
++
++      if (fixed_addr & (align_B - 1)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Unaligned capture address: 0x%" PRIx64, fixed_addr);
++      }
++
++      if (!util_vma_heap_alloc_addr(&dev->replay_heap, fixed_addr, size_B)) {
++         return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++                          "Replay address collision: 0x%" PRIx64, fixed_addr);
++      }
++
++      *addr_out = fixed_addr;
++   } else if (flags & NVKMD_VA_REPLAY) {
++      *addr_out = util_vma_heap_alloc(&dev->replay_heap, size_B, align_B);
++      if (*addr_out == 0)
++         return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "Failed to allocate virtual address range");
++   } else {
++      *addr_out = util_vma_heap_alloc(&dev->heap, size_B, align_B);
++      if (*addr_out == 0)
++         return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "Failed to allocate virtual address range");
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult MUST_CHECK
++alloc_heap_addr(struct nvkmd_nvgpu_dev *dev,
++                struct vk_object_base *log_obj,
++                enum nvkmd_va_flags flags,
++                uint64_t size_B, uint64_t align_B,
++                uint64_t fixed_addr, uint64_t *addr_out)
++{
++   simple_mtx_lock(&dev->heap_mutex);
++   VkResult result = alloc_heap_addr_locked(dev, log_obj, flags,
++                                            size_B, align_B,
++                                            fixed_addr, addr_out);
++   simple_mtx_unlock(&dev->heap_mutex);
++   return result;
++}
++
+ VkResult
+ nvkmd_nvgpu_alloc_va(struct nvkmd_dev *_dev,
+                        struct vk_object_base *log_obj,
+@@ -122,56 +134,49 @@ nvkmd_nvgpu_alloc_va(struct nvkmd_dev *_dev,
+                        uint64_t fixed_addr, struct nvkmd_va **va_out)
+ {
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+-   // VkResult result;
+-
+-   printf("unimpl: nvkmd_nvgpu_alloc_va\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
+-
+-   // struct nvkmd_nvgpu_va *va = CALLOC_STRUCT(nvkmd_nvgpu_va);
+-   // if (va == NULL)
+-   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+-
+-   // const uint32_t min_align_B = _dev->pdev->bind_align_B;
+-   // size_B = align64(size_B, min_align_B);
+-
+-   // assert(util_is_power_of_two_or_zero64(align_B));
+-   // align_B = MAX2(align_B, min_align_B);
+-
+-   // assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
+-
+-   // result = alloc_heap_addr(dev, log_obj, flags, size_B, align_B,
+-   //                          fixed_addr, &va->base.addr);
+-   // if (result != VK_SUCCESS)
+-   //    goto fail_alloc;
+-
+-   // if (flags & NVKMD_VA_SPARSE) {
+-   //    struct drm_nvgpu_vm_bind_op bind = {
+-   //       .op = DRM_nvgpu_VM_BIND_OP_MAP,
+-   //       .addr = va->base.addr,
+-   //       .range = size_B,
+-   //       .flags = DRM_nvgpu_VM_BIND_SPARSE,
+-   //    };
+-   //    result = vm_bind(dev, log_obj, &bind);
+-   //    if (result != VK_SUCCESS)
+-   //       goto fail_addr;
+-   // }
+-
+-   // va->base.ops = &nvkmd_nvgpu_va_ops;
+-   // va->base.dev = &dev->base;
+-   // va->base.flags = flags;
+-   // va->base.pte_kind = pte_kind;
+-   // va->base.size_B = size_B;
+-
+-   // *va_out = &va->base;
+-
+-   // return VK_SUCCESS;
+-
+-// fail_addr:
+-//    free_heap_addr(dev, flags, va->base.addr, size_B);
+-// fail_alloc:
+-//    FREE(va);
+-
+-//    return result;
++   VkResult result;
++
++   assert((flags & NVKMD_VA_ALLOC_FIXED) == 0); // unimpl
++   assert((flags & NVKMD_VA_GART) == 0); // unimpl
++   assert((flags & NVKMD_VA_SPARSE) == 0); // unimpl
++   assert((flags & NVKMD_VA_REPLAY) == 0); // unimpl
++
++   struct nvkmd_nvgpu_va *va = CALLOC_STRUCT(nvkmd_nvgpu_va);
++   if (va == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   const uint32_t min_align_B = _dev->pdev->bind_align_B;
++   size_B = align64(size_B, min_align_B);
++
++   assert(util_is_power_of_two_or_zero64(align_B));
++   align_B = MAX2(align_B, min_align_B);
++
++   result = alloc_heap_addr(dev, log_obj, flags, size_B, align_B,
++                           fixed_addr, &va->base.addr);
++   if (result != VK_SUCCESS)
++      return result;
++
++   assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
++
++   va->base.ops = &nvkmd_nvgpu_va_ops;
++   va->base.dev = &dev->base;
++   va->base.flags = flags;
++   va->base.pte_kind = pte_kind;
++   va->base.size_B = size_B;
++
++   struct nvgpu_as_alloc_space_args alloc_space_args = {
++      .pages = size_B / 4096, // xxx
++      .page_size = 4096,
++      .flags = NVGPU_AS_ALLOC_SPACE_FLAGS_FIXED_OFFSET,
++      .o_a.offset = va->base.addr,
++   };
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_ALLOC_SPACE, &alloc_space_args) == -1) {
++      printf("failed NVGPU32_AS_IOCTL_ALLOC_SPACE: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++   *va_out = &va->base;
++
++   return VK_SUCCESS;
+ }
+ 
+ static void
+@@ -181,7 +186,28 @@ nvkmd_nvgpu_va_free(struct nvkmd_va *_va)
+    struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
+    // VkResult result = VK_SUCCESS;
+ 
+-   printf("unimpl: nvkmd_nvgpu_va_free\n");
++
++   // unbind all current binds
++   for (int i = 0; i < va->binds_size; ++i) {
++      VkResult res = nvkmd_nvgpu_va_unbind(_va, NULL, va->binds[i].offset, va->binds[i].size);
++      assert(res == VK_SUCCESS);
++   }
++
++   // printf("unimpl: nvkmd_nvgpu_va_free\n");
++   struct nvgpu_as_free_space_args free_space_args = {
++      .offset = va->base.addr,
++      .pages = va->base.size_B / 4096,
++      .page_size = 4096,
++   };
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_FREE_SPACE, &free_space_args) == -1) {
++      printf("failed NVGPU_AS_IOCTL_FREE_SPACE %d\n", errno);
++   }
++   free_heap_addr(dev, va->base.flags, va->base.addr, va->base.size_B);
++   
++   if (va->binds != NULL) {
++      FREE(va->binds);
++   }
++   FREE(va);
+ 
+    // STATIC_ASSERT(VK_SUCCESS == 0);
+ 
+@@ -219,9 +245,9 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+                           uint64_t mem_offset_B,
+                           uint64_t range_B)
+ {
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
+-   // struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
+-   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
++   struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
++   struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
+ 
+    // assert(_mem->dev == _va->dev);
+ 
+@@ -235,8 +261,44 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    // };
+    // return vm_bind(dev, log_obj, &bind);
+ 
+-   printf("unimpl: nvkmd_nvgpu_va_bind_mem\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   struct nvmap_create_handle get_fd_args = {
++      .handle = mem->nvmap_handle,
++   };
++   if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
++      printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   // mmap(NULL, range_B, get_fd_args.fd, )
++
++   struct nvgpu_as_map_buffer_ex_args map_buffer_args = {
++      .flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT, // |*/ NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE, // xxx,
++      .compr_kind = NV_KIND_INVALID,
++      .incompr_kind = va->base.pte_kind,
++      .dmabuf_fd = get_fd_args.fd,
++      .page_size = 4096, // xxx
++      .buffer_offset = mem_offset_B,
++      .mapping_size = range_B,
++      .offset = va->base.addr + va_offset_B,
++   };
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_MAP_BUFFER_EX, &map_buffer_args) == -1) {
++      printf("failed to NVGPU_AS_IOCTL_MAP_BUFFER_EX: %d\n", errno);
++      return VK_ERROR_UNKNOWN;
++   }
++
++   close(get_fd_args.fd);
++
++   if (va->binds_size == va->binds_capacity) {
++      va->binds_capacity = (va->binds_capacity + 1) * 2;
++      va->binds = realloc(va->binds, sizeof(*va->binds) * va->binds_capacity);
++   }
++   va->binds[va->binds_size] = (struct nvkmd_nvgpu_bind) {
++      .offset = va_offset_B,
++      .size = range_B,
++   };
++   ++va->binds_size;
++
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -245,18 +307,35 @@ nvkmd_nvgpu_va_unbind(struct nvkmd_va *_va,
+                         uint64_t va_offset_B,
+                         uint64_t range_B)
+ {
+-   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
+-   // struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
+-
+-   // struct drm_nvgpu_vm_bind_op bind = {
+-   //    .op = DRM_nvgpu_VM_BIND_OP_MAP,
+-   //    .addr = va->base.addr + va_offset_B,
+-   //    .range = range_B,
+-   // };
+-   // return vm_bind(dev, log_obj, &bind);
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
++   struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
+ 
+-   printf("unimpl: nvkmd_nvgpu_va_unbind\n");
+-   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   int bind_id = -1;
++   for (int i = 0; i < va->binds_size; ++i) {
++      if (va->binds[i].offset == va_offset_B) {
++         bind_id = i;
++         break;
++      }
++   }
++
++   assert(bind_id != -1);
++   // NOTE: ranges must match for this to be correct. maybe we need to unbind & rebind if ranges don't match?
++   assert(va->binds[bind_id].size == range_B);
++
++   struct nvgpu_as_unmap_buffer_args unmap_args = {
++      .offset = va->base.addr + va_offset_B
++   };
++   if (ioctl(dev->heap_as_fd, NVGPU_AS_IOCTL_UNMAP_BUFFER, &unmap_args) == -1) {
++      printf("failed to unmap: %d\n", errno);
++   }
++
++   // remove from binds list
++   if (bind_id + 1 != va->binds_size) {
++      memcpy(&va->binds[bind_id], &va->binds[va->binds_size - 1], sizeof(va->binds[0]));
++   }
++   --va->binds_size;
++
++   return VK_SUCCESS;
+ }
+ 
+ const struct nvkmd_va_ops nvkmd_nvgpu_va_ops = {
+-- 
+2.56.0
+

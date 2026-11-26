@@ -1,0 +1,33 @@
+diff -ru a/tools/actions/container_manager.py b/tools/actions/container_manager.py
+--- a/tools/actions/container_manager.py	2026-11-25 23:28:30.907403367 -0500
++++ b/tools/actions/container_manager.py	2026-11-25 23:28:42.327034756 -0500
+@@ -200,6 +200,10 @@
+ 
+     # Set permissions
+     set_permissions(args)
++    # NVK on nvgpu (Jetson Orin): only the nodes Mesa opens (not dbg/prof/sched).
++    set_permissions(args, ["/dev/nvmap"] + glob.glob("/dev/dri/card*") +
++                    ["/dev/nvgpu/igpu0/" + n for n in ("ctrl", "as", "channel", "tsg", "power", "nvsched")],
++                    "666")
+ 
+     # Create session-specific LXC config file
+     helpers.lxc.generate_session_lxc_config(args, session)
+diff -ru a/tools/helpers/lxc.py b/tools/helpers/lxc.py
+--- a/tools/helpers/lxc.py	2026-11-25 23:28:18.297633188 -0500
++++ b/tools/helpers/lxc.py	2026-11-25 23:28:42.326998819 -0500
+@@ -62,6 +62,15 @@
+     render, _ = tools.helpers.gpu.getDriNode(args)
+     make_entry(render)
+ 
++    # NVK on nvgpu (Jetson Orin): GPU control/AS/channel nodes, nvmap, host1x-fence (sync_file)
++    # and every DRM node (NVK uses the host1x render node and the nvidia-drm display card/render).
++    make_entry("/dev/nvgpu", options="rbind,create=dir,optional 0 0")
++    make_entry("/dev/nvmap")
++    make_entry("/dev/host1x-fence")
++    for n in sorted(glob.glob("/dev/dri/card*") + glob.glob("/dev/dri/renderD*")):
++        if n != render:
++            make_entry(n)
++
+     for n in glob.glob("/dev/fb*"):
+         make_entry(n)
+     for n in glob.glob("/dev/graphics/fb*"):

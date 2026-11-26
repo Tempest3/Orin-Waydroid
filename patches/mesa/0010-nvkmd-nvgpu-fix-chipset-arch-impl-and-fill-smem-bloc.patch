@@ -1,0 +1,117 @@
+From cee0e0bf5a19177d8c1cc32881253d02f7d8e671 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:39:06 -0500
+Subject: [PATCH 10/16] nvkmd/nvgpu: fix chipset (arch|impl) and fill
+ smem/block limits
+
+nvgpu reports the GPU ID as arch (0x170) and impl (0xb); using arch
+alone made GA10B look like GA100 (SM 8.0). Also fill max_blocks_per_mp,
+sm_smem_sizes_kB and max_smem_per_wg_kB, which NAK's QMD code now
+requires (empty smem list panicked in gv100_pick_smem_size_kb). Reuse
+the nouveau winsys helpers instead of duplicating the tables.
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c | 15 +++++++++++----
+ src/nouveau/winsys/nouveau_device.c               | 12 ++++++------
+ src/nouveau/winsys/nouveau_device.h               |  4 ++++
+ 3 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index 76678d0f76c..e7d120b43c7 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -225,15 +225,20 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+ 
+    pdev->base.ops = &nvkmd_nvgpu_pdev_ops;
+    pdev->base.debug_flags = debug_flags;
++   /* nvgpu splits the chip ID: gpuId = arch | impl (GA10B = 0x170 | 0xB). */
++   const uint16_t chipset = chars.arch | chars.impl;
++   const uint8_t sm = sm_for_chipset(chipset);
++
+    pdev->base.dev_info = (struct nv_device_info) {
+     .type = NV_DEVICE_TYPE_SOC,
+     .device_name = "NVIDIA Tegra Orin",
+-    .sm = sm_for_chipset(chars.arch),
+-    .chipset = chars.arch,
++    .sm = sm,
++    .chipset = chipset,
+     .gpc_count = chars.num_gpc,
+     .tpc_count = chars.num_tpc_per_gpc * chars.num_gpc,
+-    .mp_per_tpc = mp_per_tpc_for_chipset(chars.arch),
+-    .max_warps_per_mp = max_warps_per_mp_for_sm(sm_for_chipset(chars.arch)),
++    .mp_per_tpc = mp_per_tpc_for_chipset(chipset),
++    .max_warps_per_mp = max_warps_per_mp_for_sm(sm),
++    .max_blocks_per_mp = nouveau_ws_max_blocks_per_mp_for_sm(sm),
+     .cls_copy    = chars.dma_copy_class,
+     .cls_eng2d   = chars.twod_class,
+     .cls_eng3d   = chars.threed_class,
+@@ -243,6 +248,8 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+     .nc_atom_size_B = util_cache_granularity(),
+    };
+ 
++   nouveau_ws_init_shared_mem_sizes(&pdev->base.dev_info);
++
+    strncpy(pdev->base.dev_info.chipset_name, (const char*)&chars.chipname[0], sizeof(pdev->base.dev_info.chipset_name));
+ 
+ 
+diff --git a/src/nouveau/winsys/nouveau_device.c b/src/nouveau/winsys/nouveau_device.c
+index 6e430b713fd..d0b447a032d 100644
+--- a/src/nouveau/winsys/nouveau_device.c
++++ b/src/nouveau/winsys/nouveau_device.c
+@@ -159,8 +159,8 @@ max_warps_per_mp_for_sm(uint8_t sm)
+    }
+ }
+ 
+-static uint8_t
+-max_blocks_per_mp_for_sm(uint8_t sm)
++uint8_t
++nouveau_ws_max_blocks_per_mp_for_sm(uint8_t sm)
+ {
+    /* Values taken from CUDA programming guide section "Compute Capabilities" */
+    switch (sm) {
+@@ -211,8 +211,8 @@ mp_per_tpc_for_chipset(uint16_t chipset)
+    return 1;
+ }
+ 
+-static void
+-init_shared_mem_sizes(struct nv_device_info *info)
++void
++nouveau_ws_init_shared_mem_sizes(struct nv_device_info *info)
+ {
+    if (info->sm >= 80) {
+       const uint16_t ampere_shared_mem[10] =
+@@ -588,7 +588,7 @@ nouveau_ws_device_new(drmDevicePtr drm_device)
+    // for now we hardcode those values, but in the future Nouveau could provide that information to
+    // us instead.
+    device->info.max_warps_per_mp = max_warps_per_mp_for_sm(device->info.sm);
+-   device->info.max_blocks_per_mp = max_blocks_per_mp_for_sm(device->info.sm);
++   device->info.max_blocks_per_mp = nouveau_ws_max_blocks_per_mp_for_sm(device->info.sm);
+    device->info.mp_per_tpc = mp_per_tpc_for_chipset(device->info.chipset);
+ 
+    /* Transfer queues require two kernel fixes:
+@@ -611,7 +611,7 @@ nouveau_ws_device_new(drmDevicePtr drm_device)
+    device->info.has_video = device->nouveau_version >= 0x01000403 &&
+                             device->info.cls_vdec != 0;
+ 
+-   init_shared_mem_sizes(&device->info);
++   nouveau_ws_init_shared_mem_sizes(&device->info);
+ 
+    simple_mtx_init(&device->bos_lock, mtx_plain);
+    device->bos = _mesa_pointer_hash_table_create(NULL);
+diff --git a/src/nouveau/winsys/nouveau_device.h b/src/nouveau/winsys/nouveau_device.h
+index 53cb00cd9f6..56772ec32ad 100644
+--- a/src/nouveau/winsys/nouveau_device.h
++++ b/src/nouveau/winsys/nouveau_device.h
+@@ -35,6 +35,10 @@ struct nouveau_ws_device {
+ struct nouveau_ws_device *nouveau_ws_device_new(struct _drmDevice *drm_device);
+ void nouveau_ws_device_destroy(struct nouveau_ws_device *);
+ 
++/* Shared with the nvgpu nvkmd backend, which fills nv_device_info itself. */
++uint8_t nouveau_ws_max_blocks_per_mp_for_sm(uint8_t sm);
++void nouveau_ws_init_shared_mem_sizes(struct nv_device_info *info);
++
+ uint64_t nouveau_ws_device_vram_used(struct nouveau_ws_device *);
+ uint64_t nouveau_ws_device_timestamp(struct nouveau_ws_device *device);
+ bool nouveau_ws_device_has_tiled_bo(struct nouveau_ws_device *device);
+-- 
+2.56.0
+

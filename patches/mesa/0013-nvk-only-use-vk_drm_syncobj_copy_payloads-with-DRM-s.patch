@@ -1,0 +1,35 @@
+From 2b01c4fa61a2b0ec9af450431fa7451f5e89733c Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:53:45 -0500
+Subject: [PATCH 13/16] nvk: only use vk_drm_syncobj_copy_payloads with DRM
+ syncobj syncs
+
+The nvgpu kmd uses host1x syncpoint-based syncs, so the DRM syncobj
+copy helper asserts in WSI present. Leave copy_sync_payloads NULL in
+that case; WSI then falls back to a regular queue submit.
+---
+ src/nouveau/vulkan/nvk_device.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device.c b/src/nouveau/vulkan/nvk_device.c
+index 0d8b6e5389c..297c82eac99 100644
+--- a/src/nouveau/vulkan/nvk_device.c
++++ b/src/nouveau/vulkan/nvk_device.c
+@@ -247,7 +247,13 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
+       dev->vk.command_buffer_ops = &nvk_cmd_buffer_ops;
+ 
+       dev->vk.get_timestamp = nvk_device_get_timestamp;
+-      dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
++      /* Only valid when the kmd's syncs really are DRM syncobjs (not the
++       * case for the nvgpu backend, which uses host1x syncpoints).  With no
++       * helper, WSI falls back to a normal queue submit.
++       */
++      if (pdev->vk.supported_sync_types[0] != NULL &&
++          vk_sync_type_is_drm_syncobj(pdev->vk.supported_sync_types[0]))
++         dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+ 
+       result = nvk_upload_queue_init(dev, &dev->upload);
+       if (result != VK_SUCCESS)
+-- 
+2.56.0
+

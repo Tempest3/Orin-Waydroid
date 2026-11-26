@@ -1,0 +1,1488 @@
+From 0b7743f4eff4bffaf7c6837904311f19b099fb16 Mon Sep 17 00:00:00 2001
+From: Russell Greene <russellgreene8@gmail.com>
+Date: Tue, 25 Mar 2025 17:02:17 -0600
+Subject: [PATCH 02/16] nvkmd/nvgpu: add stub impl
+
+---
+ src/nouveau/vulkan/meson.build                |   5 +
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  |  89 ++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 478 ++++++++++++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c      | 103 ++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c      | 288 +++++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     | 188 +++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c       | 266 ++++++++++
+ 7 files changed, 1417 insertions(+)
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+ create mode 100644 src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+
+diff --git a/src/nouveau/vulkan/meson.build b/src/nouveau/vulkan/meson.build
+index 3aa33802c3c..d93658239cb 100644
+--- a/src/nouveau/vulkan/meson.build
++++ b/src/nouveau/vulkan/meson.build
+@@ -96,6 +96,11 @@ nvk_files = files(
+   'nvkmd/nouveau/nvkmd_nouveau_mem.c',
+   'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
+   'nvkmd/nouveau/nvkmd_nouveau_va.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_ctx.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_dev.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_mem.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_pdev.c',
++  'nvkmd/nvgpu/nvkmd_nvgpu_va.c',
+   'nvkmd/nvkmd.c',
+   'nvkmd/nvkmd.h',
+ )
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+new file mode 100644
+index 00000000000..2f32db3f79e
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -0,0 +1,89 @@
++#include "nvkmd/nvkmd.h"
++#include "vk_drm_syncobj.h"
++#include "util/vma.h"
++
++#include "drm-uapi/nouveau_drm.h"
++
++#include <sys/types.h>
++struct nvkmd_nvgpu_pdev {
++   struct nvkmd_pdev base;
++
++   // /* Used for get_vram_used() */
++   // struct nouveau_ws_device *ws_dev;
++
++   // int primary_fd;
++
++   // struct vk_sync_type syncobj_sync_type;
++   // const struct vk_sync_type *sync_types[2];
++};
++
++NVKMD_DECL_SUBCLASS(pdev, nvgpu);
++
++VkResult nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
++                                       struct vk_object_base *log_obj,
++                                       enum nvk_debug debug_flags,
++                                       struct nvkmd_pdev **pdev_out);
++
++struct nvkmd_nvgpu_dev {
++   struct nvkmd_dev base;
++
++   // struct nouveau_ws_device *ws_dev;
++
++   // simple_mtx_t heap_mutex;
++   // struct util_vma_heap heap;
++   // struct util_vma_heap replay_heap;
++};
++
++NVKMD_DECL_SUBCLASS(dev, nvgpu);
++
++VkResult nvkmd_nvgpu_create_dev(struct nvkmd_pdev *pdev,
++                                  struct vk_object_base *log_obj,
++                                  struct nvkmd_dev **dev_out);
++
++VkResult nvkmd_nvgpu_alloc_mem(struct nvkmd_dev *dev,
++                                 struct vk_object_base *log_obj,
++                                 uint64_t size_B, uint64_t align_B,
++                                 enum nvkmd_mem_flags flags,
++                                 struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *dev,
++                                       struct vk_object_base *log_obj,
++                                       uint64_t size_B, uint64_t align_B,
++                                       uint8_t pte_kind, uint16_t tile_mode,
++                                       enum nvkmd_mem_flags flags,
++                                       struct nvkmd_mem **mem_out);
++
++VkResult nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *dev,
++                                      struct vk_object_base *log_obj,
++                                      int fd, struct nvkmd_mem **mem_out);
++
++struct nvkmd_nvgpu_va {
++   struct nvkmd_va base;
++};
++
++NVKMD_DECL_SUBCLASS(va, nvgpu);
++
++VkResult nvkmd_nvgpu_alloc_va(struct nvkmd_dev *dev,
++                                struct vk_object_base *log_obj,
++                                enum nvkmd_va_flags flags, uint8_t pte_kind,
++                                uint64_t size_B, uint64_t align_B,
++                                uint64_t fixed_addr, struct nvkmd_va **va_out);
++
++
++struct nvkmd_nvgpu_bind_ctx {
++   struct nvkmd_ctx base;
++
++   // struct nouveau_ws_device *ws_dev;
++
++   // struct drm_nouveau_sync req_wait[NVKMD_NOUVEAU_MAX_SYNCS];
++   // struct drm_nouveau_sync req_sig[NVKMD_NOUVEAU_MAX_SYNCS];
++   // struct drm_nouveau_vm_bind_op req_ops[NVKMD_NOUVEAU_MAX_BINDS];
++   // struct drm_nouveau_vm_bind req;
++};
++
++NVKMD_DECL_SUBCLASS(ctx, nvgpu_bind);
++
++VkResult nvkmd_nvgpu_create_ctx(struct nvkmd_dev *dev,
++                                  struct vk_object_base *log_obj,
++                                  enum nvkmd_engines engines,
++                                  struct nvkmd_ctx **ctx_out);
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+new file mode 100644
+index 00000000000..2457dca7711
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -0,0 +1,478 @@
++/*
++ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_nvgpu.h"
++
++#include "nouveau_bo.h"
++#include "nouveau_context.h"
++#include "nouveau_device.h"
++#include "vk_drm_syncobj.h"
++#include "vk_log.h"
++
++#include <xf86drm.h>
++
++// static ALWAYS_INLINE VkResult
++// nvkmd_nvgpu_ctx_add_sync(struct nvkmd_ctx *ctx,
++//                            struct vk_object_base *log_obj,
++//                            uint32_t *nvgpu_sync_count,
++//                            struct drm_nvgpu_sync *nvgpu_syncs,
++//                            struct vk_sync *sync,
++//                            uint64_t sync_value)
++// {
++//    if (unlikely(*nvgpu_sync_count >= NVKMD_nvgpu_MAX_SYNCS)) {
++//       VkResult result = ctx->ops->flush(ctx, log_obj);
++//       if (result != VK_SUCCESS)
++//          return result;
++//    }
++
++//    struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(sync);
++//    assert(syncobj != NULL);
++
++//    nvgpu_syncs[(*nvgpu_sync_count)++] = (struct drm_nvgpu_sync) {
++//       .flags = sync_value ? DRM_nvgpu_SYNC_TIMELINE_SYNCOBJ :
++//                             DRM_nvgpu_SYNC_SYNCOBJ,
++//       .handle = syncobj->syncobj,
++//       .timeline_value = sync_value,
++//    };
++
++//    return VK_SUCCESS;
++// }
++
++static VkResult
++nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
++                              struct vk_object_base *log_obj,
++                              enum nvkmd_engines engines,
++                              struct nvkmd_ctx **ctx_out)
++{
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   // int err;
++
++   // struct nvkmd_nvgpu_exec_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_exec_ctx);
++   // if (ctx == NULL)
++   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   // ctx->base.ops = &nvkmd_nvgpu_exec_ctx_ops;
++   // ctx->base.dev = &dev->base;
++   // ctx->ws_dev = dev->ws_dev;
++
++   // STATIC_ASSERT(NVKMD_ENGINE_COPY     == (int)nvgpu_WS_ENGINE_COPY);
++   // STATIC_ASSERT(NVKMD_ENGINE_2D       == (int)nvgpu_WS_ENGINE_2D);
++   // STATIC_ASSERT(NVKMD_ENGINE_3D       == (int)nvgpu_WS_ENGINE_3D);
++   // STATIC_ASSERT(NVKMD_ENGINE_M2MF     == (int)nvgpu_WS_ENGINE_M2MF);
++   // STATIC_ASSERT(NVKMD_ENGINE_COMPUTE  == (int)nvgpu_WS_ENGINE_COMPUTE);
++
++   // err = nvgpu_ws_context_create(dev->ws_dev, (int)engines, &ctx->ws_ctx);
++   // if (err != 0) {
++   //    FREE(ctx);
++   //    if (err == -ENOSPC)
++   //       return vk_error(log_obj, VK_ERROR_TOO_MANY_OBJECTS);
++   //    else
++   //       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   // }
++
++   // err = drmSyncobjCreate(dev->ws_dev->fd, 0, &ctx->syncobj);
++   // if (err < 0) {
++   //    nvgpu_ws_context_destroy(ctx->ws_ctx);
++   //    FREE(ctx);
++   //    return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   // }
++
++   // ctx->max_push = MIN2(NVKMD_nvgpu_MAX_PUSH, dev->ws_dev->max_push);
++
++   // ctx->req = (struct drm_nvgpu_exec) {
++   //    .channel = ctx->ws_ctx->channel,
++   //    .push_count = 0,
++   //    .wait_count = 0,
++   //    .sig_count = 0,
++   //    .push_ptr = (uintptr_t)&ctx->req_push,
++   //    .wait_ptr = (uintptr_t)&ctx->req_wait,
++   //    .sig_ptr = (uintptr_t)&ctx->req_sig,
++   // };
++
++   // *ctx_out = &ctx->base;
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_create_exec_ctx\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static void
++nvkmd_nvgpu_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   // ASSERTED int err = drmSyncobjDestroy(ctx->ws_dev->fd, ctx->syncobj);
++   // assert(err == 0);
++
++   // nvgpu_ws_context_destroy(ctx->ws_ctx);
++   // FREE(ctx);
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_destroy\n");
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_wait(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t wait_count,
++                            const struct vk_sync_wait *waits)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < wait_count; i++) {
++   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
++   //                                                 &ctx->req.wait_count,
++   //                                                 ctx->req_wait,
++   //                                                 waits[i].sync,
++   //                                                 waits[i].wait_value);
++   //    if (result != VK_SUCCESS)
++   //       return result;
++   // }
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_wait\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   // if (ctx->req.push_count == 0 &&
++   //     ctx->req.wait_count == 0 &&
++   //     ctx->req.sig_count == 0)
++   //    return VK_SUCCESS;
++
++   // int err = drmCommandWriteRead(ctx->ws_dev->fd, DRM_nvgpu_EXEC,
++   //                               &ctx->req, sizeof(ctx->req));
++   // if (err) {
++   //    VkResult result = VK_ERROR_UNKNOWN;
++   //    if (err == -ENODEV)
++   //       result = VK_ERROR_DEVICE_LOST;
++   //    return vk_errorf(log_obj, result, "DRM_nvgpu_EXEC failed: %m");
++   // }
++
++   // ctx->req.push_count = 0;
++   // ctx->req.wait_count = 0;
++   // ctx->req.sig_count = 0;
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_flush\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_exec(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t exec_count,
++                            const struct nvkmd_ctx_exec *execs)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < exec_count; i++) {
++   //    if (unlikely(ctx->req.push_count >= ctx->max_push)) {
++   //       VkResult result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++   //       if (result != VK_SUCCESS)
++   //          return result;
++   //    }
++
++   //    /* This is the hardware limit on all current GPUs */
++   //    assert((execs[i].addr % 4) == 0 && (execs[i].size_B % 4) == 0);
++   //    assert(execs[i].size_B < (1u << 23));
++
++   //    uint32_t flags = 0;
++   //    if (execs[i].no_prefetch)
++   //       flags |= DRM_nvgpu_EXEC_PUSH_NO_PREFETCH;
++
++   //    ctx->req_push[ctx->req.push_count++] = (struct drm_nvgpu_exec_push) {
++   //       .va = execs[i].addr,
++   //       .va_len = execs[i].size_B,
++   //       .flags = flags,
++   //    };
++   // }
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_exec\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_signal(struct nvkmd_ctx *_ctx,
++                              struct vk_object_base *log_obj,
++                              uint32_t signal_count,
++                              const struct vk_sync_signal *signals)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < signal_count; i++) {
++   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
++   //                                                 &ctx->req.sig_count,
++   //                                                 ctx->req_sig,
++   //                                                 signals[i].sync,
++   //                                                 signals[i].signal_value);
++   //    if (result != VK_SUCCESS)
++   //       return result;
++   // }
++
++   // return nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_signal\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_exec_ctx_sync(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj)
++{
++   // struct nvkmd_nvgpu_exec_ctx *ctx = nvkmd_nvgpu_exec_ctx(_ctx);
++   // VkResult result;
++
++   // if (unlikely(ctx->req.sig_count >= NVKMD_nvgpu_MAX_SYNCS)) {
++   //    result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++   //    if (result != VK_SUCCESS)
++   //       return result;
++   // }
++
++   // ctx->req_sig[ctx->req.sig_count++] = (struct drm_nvgpu_sync) {
++   //    .flags = DRM_nvgpu_SYNC_SYNCOBJ,
++   //    .handle = ctx->syncobj,
++   // };
++
++   // result = nvkmd_nvgpu_exec_ctx_flush(&ctx->base, log_obj);
++   // if (result != VK_SUCCESS)
++   //    return result;
++
++   // int err = drmSyncobjWait(ctx->ws_dev->fd,
++   //                          &ctx->syncobj, 1, INT64_MAX,
++   //                          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
++   //                          NULL);
++   // if (err) {
++   //    return vk_errorf(log_obj, VK_ERROR_UNKNOWN,
++   //                     "DRM_SYNCOBJ_WAIT failed: %m");
++   // }
++
++   // /* Push an empty again, just to check for errors */
++   // struct drm_nvgpu_exec empty = {
++   //    .channel = ctx->req.channel,
++   // };
++   // err = drmCommandWriteRead(ctx->ws_dev->fd, DRM_nvgpu_EXEC,
++   //                           &empty, sizeof(empty));
++   // if (err) {
++   //    return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST,
++   //                     "DRM_nvgpu_EXEC failed: %m");
++   // }
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_exec_ctx_sync\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++const struct nvkmd_ctx_ops nvkmd_nvgpu_exec_ctx_ops = {
++   .destroy = nvkmd_nvgpu_exec_ctx_destroy,
++   .wait = nvkmd_nvgpu_exec_ctx_wait,
++   .exec = nvkmd_nvgpu_exec_ctx_exec,
++   .signal = nvkmd_nvgpu_exec_ctx_signal,
++   .flush = nvkmd_nvgpu_exec_ctx_flush,
++   .sync = nvkmd_nvgpu_exec_ctx_sync,
++};
++
++static VkResult
++nvkmd_nvgpu_create_bind_ctx(struct nvkmd_dev *_dev,
++                              struct vk_object_base *log_obj,
++                              struct nvkmd_ctx **ctx_out)
++{
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++
++   // struct nvkmd_nvgpu_bind_ctx *ctx = CALLOC_STRUCT(nvkmd_nvgpu_bind_ctx);
++   // if (ctx == NULL)
++   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   // ctx->base.ops = &nvkmd_nvgpu_bind_ctx_ops;
++   // ctx->base.dev = &dev->base;
++   // ctx->ws_dev = dev->ws_dev;
++
++   // ctx->req = (struct drm_nvgpu_vm_bind) {
++   //    .flags = DRM_nvgpu_VM_BIND_RUN_ASYNC,
++   //    .op_count = 0,
++   //    .op_ptr = (uintptr_t)&ctx->req_ops,
++   //    .wait_count = 0,
++   //    .sig_count = 0,
++   //    .wait_ptr = (uintptr_t)&ctx->req_wait,
++   //    .sig_ptr = (uintptr_t)&ctx->req_sig,
++   // };
++
++   // *ctx_out = &ctx->base;
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_create_bind_ctx\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static void
++nvkmd_nvgpu_bind_ctx_destroy(struct nvkmd_ctx *_ctx)
++{
++   struct nvkmd_nvgpu_bind_ctx *ctx = nvkmd_nvgpu_bind_ctx(_ctx);
++
++   FREE(ctx);
++}
++
++static VkResult
++nvkmd_nvgpu_bind_ctx_wait(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t wait_count,
++                            const struct vk_sync_wait *waits)
++{
++   // struct nvkmd_nvgpu_bind_ctx *ctx = nvkmd_nvgpu_bind_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < wait_count; i++) {
++   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
++   //                                                 &ctx->req.wait_count,
++   //                                                 ctx->req_wait,
++   //                                                 waits[i].sync,
++   //                                                 waits[i].wait_value);
++   //    if (result != VK_SUCCESS)
++   //       return result;
++   // }
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_bind_ctx_wait\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_bind_ctx_flush(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj)
++{
++   // struct nvkmd_nvgpu_bind_ctx *ctx = nvkmd_nvgpu_bind_ctx(_ctx);
++
++   // if (ctx->req.op_count == 0 &&
++   //     ctx->req.wait_count == 0 &&
++   //     ctx->req.sig_count == 0)
++   //    return VK_SUCCESS;
++
++   // int err = drmCommandWriteRead(ctx->ws_dev->fd, DRM_nvgpu_VM_BIND,
++   //                               &ctx->req, sizeof(ctx->req));
++   // if (err) {
++   //    return vk_errorf(log_obj, VK_ERROR_UNKNOWN,
++   //                     "DRM_nvgpu_VM_BIND failed: %m");
++   // }
++
++   // ctx->req.op_count = 0;
++   // ctx->req.wait_count = 0;
++   // ctx->req.sig_count = 0;
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_bind_ctx_flush\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_bind_ctx_bind(struct nvkmd_ctx *_ctx,
++                            struct vk_object_base *log_obj,
++                            uint32_t bind_count,
++                            const struct nvkmd_ctx_bind *binds)
++{
++   // struct nvkmd_nvgpu_bind_ctx *ctx = nvkmd_nvgpu_bind_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < bind_count; i++) {
++   //    STATIC_ASSERT(NVKMD_BIND_OP_BIND   == DRM_nvgpu_VM_BIND_OP_MAP);
++   //    STATIC_ASSERT(NVKMD_BIND_OP_UNBIND == DRM_nvgpu_VM_BIND_OP_UNMAP);
++
++   //    struct drm_nvgpu_vm_bind_op op = {
++   //       .op = binds[i].op,
++   //       .addr = binds[i].va->addr + binds[i].va_offset_B,
++   //       .range = binds[i].range_B,
++   //       .flags = binds[i].va->pte_kind,
++   //    };
++
++   //    if (binds[i].op == NVKMD_BIND_OP_BIND) {
++   //       op.handle = nvkmd_nvgpu_mem(binds[i].mem)->bo->handle;
++   //       op.bo_offset = binds[i].mem_offset_B;
++   //    }
++
++   //    if (ctx->req.op_count > 0) {
++   //       struct drm_nvgpu_vm_bind_op *prev_op =
++   //          &ctx->req_ops[ctx->req.op_count - 1];
++
++   //       /* Try to coalesce bind ops together if we can */
++   //       if (op.op == prev_op->op &&
++   //           op.flags == prev_op->flags &&
++   //           op.handle == prev_op->handle &&
++   //           op.addr == prev_op->addr + prev_op->range &&
++   //           op.bo_offset == prev_op->bo_offset + prev_op->range) {
++   //          prev_op->range += op.range;
++   //          continue;
++   //       }
++   //    }
++
++   //    if (unlikely(ctx->req.op_count >= NVKMD_nvgpu_MAX_BINDS)) {
++   //       VkResult result = nvkmd_nvgpu_bind_ctx_flush(&ctx->base, log_obj);
++   //       if (result != VK_SUCCESS)
++   //          return result;
++   //    }
++
++   //    ctx->req_ops[ctx->req.op_count++] = op;
++   // }
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_bind_ctx_bind\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_bind_ctx_signal(struct nvkmd_ctx *_ctx,
++                              struct vk_object_base *log_obj,
++                              uint32_t signal_count,
++                              const struct vk_sync_signal *signals)
++{
++   // struct nvkmd_nvgpu_bind_ctx *ctx = nvkmd_nvgpu_bind_ctx(_ctx);
++
++   // for (uint32_t i = 0; i < signal_count; i++) {
++   //    VkResult result = nvkmd_nvgpu_ctx_add_sync(&ctx->base, log_obj,
++   //                                                 &ctx->req.sig_count,
++   //                                                 ctx->req_sig,
++   //                                                 signals[i].sync,
++   //                                                 signals[i].signal_value);
++   //    if (result != VK_SUCCESS)
++   //       return result;
++   // }
++
++   // return nvkmd_nvgpu_bind_ctx_flush(&ctx->base, log_obj);
++
++   printf("unimpl: nvkmd_nvgpu_bind_ctx_signal\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++const struct nvkmd_ctx_ops nvkmd_nvgpu_bind_ctx_ops = {
++   .destroy = nvkmd_nvgpu_bind_ctx_destroy,
++   .wait = nvkmd_nvgpu_bind_ctx_wait,
++   .bind = nvkmd_nvgpu_bind_ctx_bind,
++   .signal = nvkmd_nvgpu_bind_ctx_signal,
++   .flush = nvkmd_nvgpu_bind_ctx_flush,
++};
++
++VkResult
++nvkmd_nvgpu_create_ctx(struct nvkmd_dev *dev,
++                         struct vk_object_base *log_obj,
++                         enum nvkmd_engines engines,
++                         struct nvkmd_ctx **ctx_out)
++{
++   if (engines == NVKMD_ENGINE_BIND) {
++      return nvkmd_nvgpu_create_bind_ctx(dev, log_obj, ctx_out);
++   } else {
++      assert(!(engines & NVKMD_ENGINE_BIND));
++      return nvkmd_nvgpu_create_exec_ctx(dev, log_obj, engines, ctx_out);
++   }
++}
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+new file mode 100644
+index 00000000000..51e62d10a4c
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_dev.c
+@@ -0,0 +1,103 @@
++/*
++ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_nvgpu.h"
++
++#include "nouveau_device.h"
++#include "vk_log.h"
++
++#include <xf86drm.h>
++
++VkResult
++nvkmd_nvgpu_create_dev(struct nvkmd_pdev *_pdev,
++                         struct vk_object_base *log_obj,
++                         struct nvkmd_dev **dev_out)
++{
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
++
++   struct nvkmd_nvgpu_dev *dev = CALLOC_STRUCT(nvkmd_nvgpu_dev);
++   if (dev == NULL)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   dev->base.ops = &nvkmd_nvgpu_dev_ops;
++   dev->base.pdev = &pdev->base;
++   dev->base.va_start = 0;
++   dev->base.va_end = NOUVEAU_WS_DEVICE_KERNEL_RESERVATION_START;
++
++   list_inithead(&dev->base.mems);
++   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++
++   drmDevicePtr drm_device = NULL;
++   int ret = drmGetDeviceFromDevId(pdev->base.drm.render_dev, 0, &drm_device);
++   if (ret != 0) {
++      FREE(dev);
++      return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++                       "Failed to get DRM device: %m");
++   }
++
++   // dev->ws_dev = nouveau_ws_device_new(drm_device);
++   drmFreeDevice(&drm_device);
++   // if (dev->ws_dev == NULL) {
++   //    FREE(dev);
++   //    return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++   //                     "Failed to get DRM device: %m");
++   // }
++
++   // simple_mtx_init(&dev->heap_mutex, mtx_plain);
++
++   // STATIC_ASSERT(NVKMD_NOUVEAU_HEAP_START < NVKMD_NOUVEAU_HEAP_END);
++   // util_vma_heap_init(&dev->heap, NVKMD_NOUVEAU_HEAP_START,
++   //                    NVKMD_NOUVEAU_HEAP_END - NVKMD_NOUVEAU_HEAP_START);
++
++   // STATIC_ASSERT(NVKMD_NOUVEAU_REPLAY_HEAP_START <
++   //                  NVKMD_NOUVEAU_REPLAY_HEAP_END);
++   // util_vma_heap_init(&dev->replay_heap,
++   //    NVKMD_NOUVEAU_REPLAY_HEAP_START,
++   //    NVKMD_NOUVEAU_REPLAY_HEAP_END - NVKMD_NOUVEAU_REPLAY_HEAP_START);
++
++   *dev_out = &dev->base;
++
++   return VK_SUCCESS;
++}
++
++static void
++nvkmd_nvgpu_dev_destroy(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++
++   // nouveau_ws_device_destroy(dev->ws_dev);
++   FREE(dev);
++}
++
++static inline uint64_t
++nvkmd_nvgpu_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++
++   // return nouveau_ws_device_timestamp(dev->ws_dev);
++   printf("umimpl: nvkmd_nvgpu_dev_get_gpu_timestamp\n");
++   return 0;
++}
++
++static int
++nvkmd_nvgpu_dev_get_drm_fd(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++
++   printf("umimpl: nvkmd_nvgpu_dev_get_drm_fd\n");
++   return -1;
++   // return dev->ws_dev->fd;
++}
++
++const struct nvkmd_dev_ops nvkmd_nvgpu_dev_ops = {
++   .destroy = nvkmd_nvgpu_dev_destroy,
++   .get_gpu_timestamp = nvkmd_nvgpu_dev_get_gpu_timestamp,
++   .get_drm_fd = nvkmd_nvgpu_dev_get_drm_fd,
++   .alloc_mem = nvkmd_nvgpu_alloc_mem,
++   .alloc_tiled_mem = nvkmd_nvgpu_alloc_tiled_mem,
++   .import_dma_buf = nvkmd_nvgpu_import_dma_buf,
++   .alloc_va = nvkmd_nvgpu_alloc_va,
++   .create_ctx = nvkmd_nvgpu_create_ctx,
++};
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+new file mode 100644
+index 00000000000..fd0503fa2e3
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -0,0 +1,288 @@
++/*
++ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_nvgpu.h"
++
++#include "nouveau_bo.h"
++#include "vk_log.h"
++
++#include "vulkan/vulkan_core.h"
++#include <sys/mman.h>
++
++VkResult
++nvkmd_nvgpu_alloc_mem(struct nvkmd_dev *dev,
++                        struct vk_object_base *log_obj,
++                        uint64_t size_B, uint64_t align_B,
++                        enum nvkmd_mem_flags flags,
++                        struct nvkmd_mem **mem_out)
++{
++   return nvkmd_nvgpu_alloc_tiled_mem(dev, log_obj, size_B, align_B,
++                                        0 /* pte_kind */, 0 /* tile_mode */,
++                                        flags, mem_out);
++}
++
++static VkResult
++create_mem_or_close_bo(struct nvkmd_nvgpu_dev *dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_mem_flags mem_flags,
++                       struct nvgpu_ws_bo *bo,
++                       enum nvkmd_va_flags va_flags,
++                       uint8_t pte_kind, uint64_t va_align_B,
++                       struct nvkmd_mem **mem_out)
++{
++   printf("unimpl: create_mem_or_close_bo\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++//    const uint64_t size_B = bo->size;
++//    VkResult result;
++
++//    struct nvkmd_nvgpu_mem *mem = CALLOC_STRUCT(nvkmd_nvgpu_mem);
++//    if (mem == NULL) {
++//       result = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++//       goto fail_bo;
++//    }
++
++//    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nvgpu_mem_ops,
++//                   mem_flags, size_B, dev->base.pdev->bind_align_B);
++//    mem->bo = bo;
++
++//    result = nvkmd_dev_alloc_va(&dev->base, log_obj,
++//                                va_flags, pte_kind,
++//                                size_B, va_align_B,
++//                                0 /* fixed_addr */,
++//                                &mem->base.va);
++//    if (result != VK_SUCCESS)
++//       goto fail_mem;
++
++//    result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0 /* va_offset_B */,
++//                               &mem->base, 0 /* mem_offset_B */, size_B);
++//    if (result != VK_SUCCESS)
++//       goto fail_va;
++
++//    *mem_out = &mem->base;
++
++//    return VK_SUCCESS;
++
++// fail_va:
++//    nvkmd_va_free(mem->base.va);
++// fail_mem:
++//    FREE(mem);
++// fail_bo:
++//    nvgpu_ws_bo_destroy(bo);
++
++//    return result;
++}
++
++VkResult
++nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
++                              struct vk_object_base *log_obj,
++                              uint64_t size_B, uint64_t align_B,
++                              uint8_t pte_kind, uint16_t tile_mode,
++                              enum nvkmd_mem_flags flags,
++                              struct nvkmd_mem **mem_out)
++{
++   printf("unimpl: nvkmd_nvgpu_alloc_tiled_mem\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   // const struct nv_device_info *dev_info = &dev->base.pdev->dev_info;
++
++   // /* Only one placement flag may be specified */
++   // assert(util_bitcount(flags & (NVKMD_MEM_LOCAL |
++   //                               NVKMD_MEM_GART |
++   //                               NVKMD_MEM_VRAM)) == 1);
++   // enum nvgpu_ws_bo_flags domains = 0;
++   // if (flags & NVKMD_MEM_LOCAL) {
++   //    domains |= nvgpu_WS_BO_GART;
++   //    if (dev_info->vram_size_B > 0)
++   //       domains |= nvgpu_WS_BO_VRAM;
++   // } else if (flags & NVKMD_MEM_GART) {
++   //    domains |= nvgpu_WS_BO_GART;
++   // } else if (flags & NVKMD_MEM_VRAM) {
++   //    domains |= nvgpu_WS_BO_VRAM;
++   // }
++
++   // if (dev->base.pdev->debug_flags & NVK_DEBUG_FORCE_GART)
++   //    domains = nvgpu_WS_BO_GART;
++
++   // /* TODO:
++   //  *
++   //  * VRAM maps on Kepler appear to be broken and we don't really know why.
++   //  * My NVIDIA contact doesn't remember them not working so they probably
++   //  * should but they don't today.  Force everything that may be mapped to
++   //  * use GART for now.
++   //  */
++   // if (dev_info->chipset < 0x110 && (flags & nvgpu_WS_BO_MAP)) {
++   //    assert(domains & nvgpu_WS_BO_GART);
++   //    domains = nvgpu_WS_BO_GART;
++   // }
++
++   // const uint32_t mem_align_B = _dev->pdev->bind_align_B;
++   // size_B = align64(size_B, mem_align_B);
++
++   // assert(util_is_power_of_two_or_zero64(align_B));
++   // const uint64_t va_align_B = MAX2(mem_align_B, align_B);
++
++   // enum nvgpu_ws_bo_flags nvgpu_flags = domains;
++   // if (flags & NVKMD_MEM_CAN_MAP)
++   //    nvgpu_flags |= nvgpu_WS_BO_MAP;
++   // if (!(flags & NVKMD_MEM_SHARED))
++   //    nvgpu_flags |= nvgpu_WS_BO_NO_SHARE;
++
++   // struct nvgpu_ws_bo *bo = nvgpu_ws_bo_new_tiled(dev->ws_dev,
++   //                                                    size_B, mem_align_B,
++   //                                                    pte_kind, tile_mode,
++   //                                                    nvgpu_flags);
++   // if (bo == NULL)
++   //    return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
++
++   // enum nvkmd_va_flags va_flags = 0;
++   // if (domains == nvgpu_WS_BO_GART)
++   //    va_flags |= NVKMD_VA_GART;
++
++   // return create_mem_or_close_bo(dev, log_obj, flags, bo,
++   //                               va_flags, pte_kind, va_align_B,
++   //                               mem_out);
++}
++
++VkResult
++nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *_dev,
++                             struct vk_object_base *log_obj,
++                             int fd, struct nvkmd_mem **mem_out)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++
++   printf("unimpl: nvkmd_nvgpu_import_dma_buf\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++
++   // struct nvgpu_ws_bo *bo = nvgpu_ws_bo_from_dma_buf(dev->ws_dev, fd);
++   // if (bo == NULL)
++   //    return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "%m");
++
++   // enum nvkmd_mem_flags flags = NVKMD_MEM_SHARED;
++
++   // /* We always set LOCAL for shared things because we don't know where the
++   //  * kernel will place it.  The query only tells us where it is.
++   //  */
++   // flags |= NVKMD_MEM_LOCAL;
++
++   // if (bo->flags & nvgpu_WS_BO_MAP)
++   //    flags |= NVKMD_MEM_CAN_MAP;
++
++   // return create_mem_or_close_bo(dev, log_obj, flags, bo,
++   //                               0 /* va_flags */,
++   //                               0 /* pte_kind */,
++   //                               0 /* va_align_B */,
++   //                               mem_out);
++}
++
++static void
++nvkmd_nvgpu_mem_free(struct nvkmd_mem *_mem)
++{
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++
++   // nvkmd_va_free(mem->base.va);
++   // nvgpu_ws_bo_destroy(mem->bo);
++   // FREE(mem);
++   printf("unimpl: nvkmd_nvgpu_mem_free\n");
++}
++
++static VkResult
++nvkmd_nvgpu_mem_map(struct nvkmd_mem *_mem,
++                      struct vk_object_base *log_obj,
++                      enum nvkmd_mem_map_flags map_flags,
++                      void *fixed_addr,
++                      void **map_out)
++{
++   printf("unimpl: nvkmd_nvgpu_mem_map\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_mem->dev);
++
++   // int prot = 0;
++   // if (map_flags & NVKMD_MEM_MAP_RD)
++   //    prot |= PROT_READ;
++   // if (map_flags & NVKMD_MEM_MAP_WR)
++   //    prot |= PROT_WRITE;
++
++   // int flags = MAP_SHARED;
++   // if (map_flags & NVKMD_MEM_MAP_FIXED)
++   //    flags |= MAP_FIXED;
++
++   // void *map = mmap(fixed_addr, mem->base.size_B, prot, flags,
++   //                  dev->ws_dev->fd, mem->bo->map_handle);
++   // if (map == MAP_FAILED)
++   //    return vk_error(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++
++   // *map_out = map;
++
++   // return VK_SUCCESS;
++}
++
++static void
++nvkmd_nvgpu_mem_unmap(struct nvkmd_mem *_mem,
++                        enum nvkmd_mem_map_flags flags,
++                        void *map)
++{
++   printf("unimpl: nvkmd_nvgpu_mem_unmap\n");
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++
++   // munmap(map, mem->base.size_B);
++}
++
++static VkResult
++nvkmd_nvgpu_mem_overmap(struct nvkmd_mem *_mem,
++                          struct vk_object_base *log_obj,
++                          enum nvkmd_mem_map_flags flags,
++                          void *map)
++{
++   printf("unimpl: nvkmd_nvgpu_mem_overmap\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++
++   // void *new_map = mmap(map, mem->base.size_B, PROT_NONE,
++   //                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++   // if (new_map == MAP_FAILED) {
++   //    return vk_errorf(log_obj, VK_ERROR_MEMORY_MAP_FAILED,
++   //                     "Failed to map over original mapping");
++   // }
++
++   // assert(new_map == map);
++
++   // return VK_SUCCESS;
++}
++
++static VkResult
++nvkmd_nvgpu_mem_export_dma_buf(struct nvkmd_mem *_mem,
++                                 struct vk_object_base *log_obj,
++                                 int *fd_out)
++{
++   printf("unimpl: nvkmd_nvgpu_mem_export_dma_buf\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++
++   // int err = nvgpu_ws_bo_dma_buf(mem->bo, fd_out);
++   // if (err)
++   //    return vk_errorf(log_obj, VK_ERROR_TOO_MANY_OBJECTS,
++   //                     "Failed to export dma-buf: %m");
++
++   // return VK_SUCCESS;
++}
++
++static uint32_t
++nvkmd_nvgpu_mem_log_handle(struct nvkmd_mem *_mem)
++{
++   printf("unimpl: nvkmd_nvgpu_mem_log_handle\n");
++   return 0;
++   // return nvkmd_nvgpu_mem(_mem)->bo->handle;
++}
++
++const struct nvkmd_mem_ops nvkmd_nvgpu_mem_ops = {
++   .free = nvkmd_nvgpu_mem_free,
++   .map = nvkmd_nvgpu_mem_map,
++   .unmap = nvkmd_nvgpu_mem_unmap,
++   .overmap = nvkmd_nvgpu_mem_overmap,
++   .export_dma_buf = nvkmd_nvgpu_mem_export_dma_buf,
++   .log_handle = nvkmd_nvgpu_mem_log_handle,
++};
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+new file mode 100644
+index 00000000000..a10a074af97
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -0,0 +1,188 @@
++/*
++ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_nvgpu.h"
++
++#include "nouveau_device.h"
++#include "util/os_misc.h"
++#include "vk_log.h"
++
++#include <fcntl.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <xf86drm.h>
++
++static bool
++drm_device_is_tegra(const char *path)
++{
++   int fd = open(path, O_RDWR | O_CLOEXEC);
++   if (fd < 0)
++      return false;
++
++   drmVersionPtr ver = drmGetVersion(fd);
++   if (!ver) {
++      close(fd);
++      return false;
++   }
++
++   const bool is_nouveau = !strncmp("tegra", ver->name, ver->name_len);
++
++   drmFreeVersion(ver);
++   close(fd);
++
++   return is_nouveau;
++}
++
++VkResult
++nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
++                              struct vk_object_base *log_obj,
++                              enum nvk_debug debug_flags,
++                              struct nvkmd_pdev **pdev_out)
++{
++   if (!(drm_device->available_nodes & (1 << DRM_NODE_RENDER)))
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++
++   switch (drm_device->bustype) {
++   case DRM_BUS_PLATFORM: {
++      const char *compat_prefix = "nvidia,";
++      bool found = false;
++      for (int i = 0; drm_device->deviceinfo.platform->compatible[i] != NULL; i++) {
++         if (strncmp(drm_device->deviceinfo.platform->compatible[0], compat_prefix, strlen(compat_prefix)) == 0) {
++            found = true;
++            break;
++         }
++      }
++      if (!found)
++         return VK_ERROR_INCOMPATIBLE_DRIVER;
++      break;
++   }
++
++   default:
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++
++   if (!drm_device_is_tegra(drm_device->nodes[DRM_NODE_RENDER]))
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++
++//    struct nouveau_ws_device *ws_dev = nouveau_ws_device_new(drm_device);
++//    if (!ws_dev)
++//       return VK_ERROR_INCOMPATIBLE_DRIVER;
++
++//    if (!ws_dev->has_vm_bind) {
++//       nouveau_ws_device_destroy(ws_dev);
++//       /* NVK Requires a Linux kernel version 6.6 or later */
++//       return VK_ERROR_INCOMPATIBLE_DRIVER;
++//    }
++
++//    struct stat st;
++//    if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
++//       nouveau_ws_device_destroy(ws_dev);
++//       return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
++//                        "fstat() failed on %s: %m",
++//                        drm_device->nodes[DRM_NODE_RENDER]);
++//    }
++//    const dev_t render_dev = st.st_rdev;
++
++   struct nvkmd_nvgpu_pdev *pdev = CALLOC_STRUCT(nvkmd_nvgpu_pdev);
++   if (pdev == NULL) {
++      // nouveau_ws_device_destroy(ws_dev);
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   pdev->base.ops = &nvkmd_nvgpu_pdev_ops;
++   pdev->base.debug_flags = debug_flags;
++//    pdev->base.dev_info = ws_dev->info;
++//    pdev->base.kmd_info = (struct nvkmd_info) {
++//       .has_dma_buf = true,
++//       .has_get_vram_used = nouveau_ws_device_vram_used(ws_dev) != 0,
++//       .has_alloc_tiled = nouveau_ws_device_has_tiled_bo(ws_dev),
++//       .has_map_fixed = true,
++//       .has_overmap = true,
++//    };
++
++//    /* Nouveau uses the OS page size for all pages, regardless of whether they
++//     * come from VRAM or system RAM.
++//     */
++//    uint64_t os_page_size;
++//    os_get_page_size(&os_page_size);
++//    assert(os_page_size <= UINT32_MAX);
++//    pdev->base.bind_align_B = os_page_size;
++
++//    pdev->base.drm.render_dev = render_dev;
++
++//    /* DRM primary is optional */
++//    if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++//        !stat(drm_device->nodes[DRM_NODE_PRIMARY], &st))
++//       pdev->base.drm.primary_dev = st.st_rdev;
++
++//    pdev->primary_fd = -1;
++//    pdev->ws_dev = ws_dev;
++
++//    pdev->syncobj_sync_type = vk_drm_syncobj_get_type(ws_dev->fd);
++//    pdev->sync_types[0] = &pdev->syncobj_sync_type;
++//    pdev->sync_types[1] = NULL;
++//    pdev->base.sync_types = pdev->sync_types;
++
++   *pdev_out = &pdev->base;
++
++   return VK_SUCCESS;
++}
++
++static void
++nvkmd_nvgpu_pdev_destroy(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
++
++//    if (pdev->primary_fd >= 0)
++//       close(pdev->primary_fd);
++
++//    nouveau_ws_device_destroy(pdev->ws_dev);
++   FREE(pdev);
++}
++
++static uint64_t
++nvkmd_nvgpu_pdev_get_vram_used(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
++
++//    return nouveau_ws_device__used(pdev->ws_dev);
++      printf("unimpl: nvkmd_nvgpu_pdev_get_vram_used\n");
++      return 0;
++}
++
++static int
++nvkmd_nvgpu_pdev_get_drm_primary_fd(struct nvkmd_pdev *_pdev)
++{
++    struct nvkmd_nvgpu_pdev *pdev = nvkmd_nvgpu_pdev(_pdev);
++    printf("unimpl: nvkmd_nvgpu_pdev_get_drm_primary_fd\n");
++    return -1;
++
++//    if (pdev->primary_fd >= 0)
++//       return pdev->primary_fd;
++
++//    if (pdev->base.drm.primary_dev == 0)
++//       return -1;
++
++//    drmDevicePtr drm_device = NULL;
++//    int ret = drmGetDeviceFromDevId(pdev->base.drm.primary_dev, 0, &drm_device);
++//    if (ret != 0)
++//       return -1;
++
++//    int fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
++//    drmFreeDevice(&drm_device);
++
++//    /* TODO: Test if the FD is usable? */
++
++//    pdev->primary_fd = fd;
++
++//    return pdev->primary_fd;
++}
++
++const struct nvkmd_pdev_ops nvkmd_nvgpu_pdev_ops = {
++   .destroy = nvkmd_nvgpu_pdev_destroy,
++   .get_vram_used = nvkmd_nvgpu_pdev_get_vram_used,
++   .get_drm_primary_fd = nvkmd_nvgpu_pdev_get_drm_primary_fd,
++   .create_dev = nvkmd_nvgpu_create_dev,
++};
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+new file mode 100644
+index 00000000000..a15826e1e01
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -0,0 +1,266 @@
++/*
++ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nvkmd_nvgpu.h"
++
++#include "nouveau_bo.h"
++#include "util/bitscan.h"
++#include "vk_log.h"
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <xf86drm.h>
++
++// static VkResult MUST_CHECK
++// alloc_heap_addr_locked(struct nvkmd_nvgpu_dev *dev,
++//                        struct vk_object_base *log_obj,
++//                        enum nvkmd_va_flags flags,
++//                        uint64_t size_B, uint64_t align_B,
++//                        uint64_t fixed_addr, uint64_t *addr_out)
++// {
++//    if (flags & NVKMD_VA_ALLOC_FIXED) {
++//       assert(flags & NVKMD_VA_REPLAY);
++//       if (fixed_addr < NVKMD_nvgpu_REPLAY_HEAP_START ||
++//           fixed_addr >= NVKMD_nvgpu_REPLAY_HEAP_END) {
++//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++//                           "Capture address 0x%" PRIx64 " not in the reaplay "
++//                           "heap address range [0x%" PRIx64 ", 0x%" PRIx64 ")",
++//                           fixed_addr, NVKMD_nvgpu_REPLAY_HEAP_START,
++//                           NVKMD_nvgpu_REPLAY_HEAP_END);
++//       }
++
++//       if (fixed_addr & (align_B - 1)) {
++//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++//                           "Unaligned capture address: 0x%" PRIx64, fixed_addr);
++//       }
++
++//       if (!util_vma_heap_alloc_addr(&dev->replay_heap, fixed_addr, size_B)) {
++//          return vk_errorf(log_obj, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
++//                           "Replay address collision: 0x%" PRIx64, fixed_addr);
++//       }
++
++//       *addr_out = fixed_addr;
++//    } else if (flags & NVKMD_VA_REPLAY) {
++//       *addr_out = util_vma_heap_alloc(&dev->replay_heap, size_B, align_B);
++//       if (*addr_out == 0)
++//          return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++//                           "Failed to allocate virtual address range");
++//    } else {
++//       *addr_out = util_vma_heap_alloc(&dev->heap, size_B, align_B);
++//       if (*addr_out == 0)
++//          return vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++//                           "Failed to allocate virtual address range");
++//    }
++
++//    return VK_SUCCESS;
++// }
++
++// static VkResult MUST_CHECK
++// alloc_heap_addr(struct nvkmd_nvgpu_dev *dev,
++//                 struct vk_object_base *log_obj,
++//                 enum nvkmd_va_flags flags,
++//                 uint64_t size_B, uint64_t align_B,
++//                 uint64_t fixed_addr, uint64_t *addr_out)
++// {
++//    simple_mtx_lock(&dev->heap_mutex);
++//    VkResult result = alloc_heap_addr_locked(dev, log_obj, flags,
++//                                             size_B, align_B,
++//                                             fixed_addr, addr_out);
++//    simple_mtx_unlock(&dev->heap_mutex);
++//    return result;
++// }
++
++// static void
++// free_heap_addr(struct nvkmd_nvgpu_dev *dev,
++//                enum nvkmd_va_flags flags,
++//                uint64_t addr, uint64_t size_B)
++// {
++//    simple_mtx_lock(&dev->heap_mutex);
++//    if (flags & NVKMD_VA_REPLAY) {
++//       assert(addr >= NVKMD_nvgpu_REPLAY_HEAP_START);
++//       assert(addr <= NVKMD_nvgpu_REPLAY_HEAP_END);
++//       assert(addr + size_B <= NVKMD_nvgpu_REPLAY_HEAP_END);
++
++//       util_vma_heap_free(&dev->replay_heap, addr, size_B);
++//    } else {
++//       assert(addr >= NVKMD_nvgpu_HEAP_START);
++//       assert(addr <= NVKMD_nvgpu_HEAP_END);
++//       assert(addr + size_B <= NVKMD_nvgpu_HEAP_END);
++
++//       util_vma_heap_free(&dev->heap, addr, size_B);
++//    }
++//    simple_mtx_unlock(&dev->heap_mutex);
++// }
++
++static VkResult MUST_CHECK
++vm_bind(struct nvkmd_nvgpu_dev *dev,
++        struct vk_object_base *log_obj,
++        struct drm_nvgpu_vm_bind_op *op)
++{
++   // struct drm_nvgpu_vm_bind vmbind = {
++   //    .op_count = 1,
++   //    .op_ptr = (uint64_t)(uintptr_t)(void *)op,
++   // };
++   // int err = drmCommandWriteRead(dev->ws_dev->fd, DRM_nvgpu_VM_BIND,
++   //                               &vmbind, sizeof(vmbind));
++   // if (err)
++   //    return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "vm_bind failed: %m");
++
++   // return VK_SUCCESS;
++
++   printf("unimpl: vm_bind\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++VkResult
++nvkmd_nvgpu_alloc_va(struct nvkmd_dev *_dev,
++                       struct vk_object_base *log_obj,
++                       enum nvkmd_va_flags flags, uint8_t pte_kind,
++                       uint64_t size_B, uint64_t align_B,
++                       uint64_t fixed_addr, struct nvkmd_va **va_out)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
++   // VkResult result;
++
++   printf("unimpl: nvkmd_nvgpu_alloc_va\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   // struct nvkmd_nvgpu_va *va = CALLOC_STRUCT(nvkmd_nvgpu_va);
++   // if (va == NULL)
++   //    return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   // const uint32_t min_align_B = _dev->pdev->bind_align_B;
++   // size_B = align64(size_B, min_align_B);
++
++   // assert(util_is_power_of_two_or_zero64(align_B));
++   // align_B = MAX2(align_B, min_align_B);
++
++   // assert((fixed_addr == 0) == !(flags & NVKMD_VA_ALLOC_FIXED));
++
++   // result = alloc_heap_addr(dev, log_obj, flags, size_B, align_B,
++   //                          fixed_addr, &va->base.addr);
++   // if (result != VK_SUCCESS)
++   //    goto fail_alloc;
++
++   // if (flags & NVKMD_VA_SPARSE) {
++   //    struct drm_nvgpu_vm_bind_op bind = {
++   //       .op = DRM_nvgpu_VM_BIND_OP_MAP,
++   //       .addr = va->base.addr,
++   //       .range = size_B,
++   //       .flags = DRM_nvgpu_VM_BIND_SPARSE,
++   //    };
++   //    result = vm_bind(dev, log_obj, &bind);
++   //    if (result != VK_SUCCESS)
++   //       goto fail_addr;
++   // }
++
++   // va->base.ops = &nvkmd_nvgpu_va_ops;
++   // va->base.dev = &dev->base;
++   // va->base.flags = flags;
++   // va->base.pte_kind = pte_kind;
++   // va->base.size_B = size_B;
++
++   // *va_out = &va->base;
++
++   // return VK_SUCCESS;
++
++// fail_addr:
++//    free_heap_addr(dev, flags, va->base.addr, size_B);
++// fail_alloc:
++//    FREE(va);
++
++//    return result;
++}
++
++static void
++nvkmd_nvgpu_va_free(struct nvkmd_va *_va)
++{
++   struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
++   struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
++   // VkResult result = VK_SUCCESS;
++
++   printf("unimpl: nvkmd_nvgpu_va_free\n");
++
++   // STATIC_ASSERT(VK_SUCCESS == 0);
++
++   // {
++   //    struct drm_nvgpu_vm_bind_op bind = {
++   //       .op = DRM_nvgpu_VM_BIND_OP_UNMAP,
++   //       .addr = va->base.addr,
++   //       .range = va->base.size_B,
++   //    };
++   //    result |= vm_bind(dev, NULL, &bind);
++   // }
++
++   // if (va->base.flags & NVKMD_VA_SPARSE) {
++   //    struct drm_nvgpu_vm_bind_op bind = {
++   //       .op = DRM_nvgpu_VM_BIND_OP_UNMAP,
++   //       .addr = va->base.addr,
++   //       .range = va->base.size_B,
++   //       .flags = DRM_nvgpu_VM_BIND_SPARSE,
++   //    };
++   //    result |= vm_bind(dev, NULL, &bind);
++   // }
++
++   // /* If unbinding fails, we leak the VA range */
++   // if (result == VK_SUCCESS)
++   //    free_heap_addr(dev, va->base.flags, va->base.addr, va->base.size_B);
++
++   // FREE(va);
++}
++
++static VkResult
++nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
++                          struct vk_object_base *log_obj,
++                          uint64_t va_offset_B,
++                          struct nvkmd_mem *_mem,
++                          uint64_t mem_offset_B,
++                          uint64_t range_B)
++{
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
++   // struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
++   // struct nvkmd_nvgpu_mem *mem = nvkmd_nvgpu_mem(_mem);
++
++   // assert(_mem->dev == _va->dev);
++
++   // struct drm_nvgpu_vm_bind_op bind = {
++   //    .op = DRM_nvgpu_VM_BIND_OP_MAP,
++   //    .handle = mem->bo->handle,
++   //    .addr = va->base.addr + va_offset_B,
++   //    .range = range_B,
++   //    .bo_offset = mem_offset_B,
++   //    .flags = va->base.pte_kind,
++   // };
++   // return vm_bind(dev, log_obj, &bind);
++
++   printf("unimpl: nvkmd_nvgpu_va_bind_mem\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++static VkResult
++nvkmd_nvgpu_va_unbind(struct nvkmd_va *_va,
++                        struct vk_object_base *log_obj,
++                        uint64_t va_offset_B,
++                        uint64_t range_B)
++{
++   // struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_va->dev);
++   // struct nvkmd_nvgpu_va *va = nvkmd_nvgpu_va(_va);
++
++   // struct drm_nvgpu_vm_bind_op bind = {
++   //    .op = DRM_nvgpu_VM_BIND_OP_MAP,
++   //    .addr = va->base.addr + va_offset_B,
++   //    .range = range_B,
++   // };
++   // return vm_bind(dev, log_obj, &bind);
++
++   printf("unimpl: nvkmd_nvgpu_va_unbind\n");
++   return VK_ERROR_OUT_OF_HOST_MEMORY;
++}
++
++const struct nvkmd_va_ops nvkmd_nvgpu_va_ops = {
++   .free = nvkmd_nvgpu_va_free,
++   .bind_mem = nvkmd_nvgpu_va_bind_mem,
++   .unbind = nvkmd_nvgpu_va_unbind,
++};
+-- 
+2.56.0
+

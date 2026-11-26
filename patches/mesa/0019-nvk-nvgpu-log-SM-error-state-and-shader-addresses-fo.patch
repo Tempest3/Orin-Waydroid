@@ -1,0 +1,90 @@
+From fda62f8011f8a054e1834b9faf55bb67ed895d4f Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 01:22:56 -0500
+Subject: [PATCH 19/20] nvk/nvgpu: log SM error state and shader addresses for
+ fault triage
+
+On a failed GPFIFO submit, read the TSG's per-SM error records
+(NVGPU_TSG_IOCTL_READ_SINGLE_SM_ERROR_STATE) and log ESRs + faulting PC.
+NVK_LOG_SHADER_ADDR=1 logs each uploaded shader's code range so the PC
+can be mapped back to a shader.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_shader.c               |  7 +++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 27 +++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index da3af05751a..fa2a756d01e 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -739,6 +739,13 @@ nvk_shader_upload(struct nvk_device *dev, struct nvk_shader *shader)
+       }
+       shader->gs_hdr_addr = shader->upload_addr + gs_hdr_offset;
+       shader->data_addr = shader->upload_addr + data_offset;
++      /* Map an SM fault PC (nvgpu warp_esr_pc) back to a shader. */
++      if (debug_get_bool_option("NVK_LOG_SHADER_ADDR", false))
++         mesa_logi("nvk: shader %s code 0x%" PRIx64 "..0x%" PRIx64 " (%u instrs)",
++                   _mesa_shader_stage_to_string(shader->info.stage),
++                   shader->upload_addr + code_offset,
++                   shader->upload_addr + code_offset + shader->code_size,
++                   shader->info.num_instrs);
+    }
+    free(data);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index c596ff16451..c093b6559d4 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -17,6 +17,8 @@
+ #include <xf86drm.h>
+ #include "drm-uapi/tegra_drm.h"
+ #include "util/u_memory.h"
++#include "util/log.h"
++#include <inttypes.h>
+ #include "vulkan/vulkan_core.h"
+ #include <sys/ioctl.h>
+ 
+@@ -25,6 +27,30 @@
+ #include "drm-uapi/nvgpu.h"
+ // #include "drm-uapi/nvmisc.h"
+ 
++/* After a fault the kernel keeps per-SM error records in the TSG (global/warp ESR + faulting PC). */
++static void
++nvkmd_nvgpu_log_sm_errors(struct nvkmd_nvgpu_exec_ctx *ctx)
++{
++   static bool logged;
++   if (logged)
++      return;
++   logged = true;
++   for (uint32_t sm = 0; sm < 64; sm++) {
++      struct nvgpu_tsg_sm_error_state_record rec = { 0 };
++      struct nvgpu_tsg_read_single_sm_error_state_args args = {
++         .sm_id = sm,
++         .record_mem = (__u64)(uintptr_t)&rec,
++         .record_size = sizeof(rec),
++      };
++      if (ioctl(ctx->tsg_fd, NVGPU_TSG_IOCTL_READ_SINGLE_SM_ERROR_STATE, &args) == -1)
++         break;
++      if (rec.global_esr || rec.warp_esr)
++         mesa_loge("nvgpu: SM %u fault: global_esr 0x%08x warp_esr 0x%08x pc 0x%" PRIx64
++                   " cga_esr 0x%08x", sm, rec.global_esr, rec.warp_esr,
++                   (uint64_t)rec.warp_esr_pc, rec.cga_esr);
++   }
++}
++
+ static VkResult
+ nvkmd_nvgpu_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+                              struct vk_object_base *log_obj);
+@@ -357,6 +383,7 @@ nvkmd_nvgpu_exec_ctx_flush_impl(struct nvkmd_ctx *_ctx,
+    };
+    if (nvgpu_ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_SUBMIT_GPFIFO, &submit_args) == -1) {
+       printf("failed to NVGPU_IOCTL_CHANNEL_SUBMIT_GPFIFO %d (%s)\n", errno, strerror(errno));
++      nvkmd_nvgpu_log_sm_errors(ctx);
+       return VK_ERROR_UNKNOWN;
+    }
+    ctx->push_count = 0; 
+-- 
+2.56.0
+

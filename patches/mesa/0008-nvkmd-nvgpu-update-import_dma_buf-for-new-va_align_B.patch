@@ -1,0 +1,42 @@
+From d540fab8f7e41ac87f02c2c029736a3a4ef87e33 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 19:27:05 -0500
+Subject: [PATCH 08/16] nvkmd/nvgpu: update import_dma_buf for new va_align_B
+ parameter
+
+nvkmd's import_dma_buf op gained a va_align_B argument upstream; update
+the (still unimplemented) nvgpu stub to match.
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h     | 2 +-
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index 9ccd6208e93..e9bca0c3571 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -88,7 +88,7 @@ VkResult nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *dev,
+ 
+ VkResult nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *dev,
+                                       struct vk_object_base *log_obj,
+-                                      int fd, struct nvkmd_mem **mem_out);
++                                      int fd, uint64_t va_align_B, struct nvkmd_mem **mem_out);
+ 
+ struct nvkmd_nvgpu_bind {
+    uint64_t offset;
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index 68ee368c728..0679fec164a 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -231,7 +231,7 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+ VkResult
+ nvkmd_nvgpu_import_dma_buf(struct nvkmd_dev *_dev,
+                              struct vk_object_base *log_obj,
+-                             int fd, struct nvkmd_mem **mem_out)
++                             int fd, uint64_t va_align_B, struct nvkmd_mem **mem_out)
+ {
+    struct nvkmd_nvgpu_dev *dev = nvkmd_nvgpu_dev(_dev);
+ 
+-- 
+2.56.0
+

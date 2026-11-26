@@ -1,0 +1,292 @@
+From 26efc0af7bf04621e36100125e32589b74c16eb6 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Wed, 25 Nov 2026 20:35:55 -0500
+Subject: [PATCH 16/16] nvkmd/nvgpu: sync_file import/export via host1x-fence
+
+L4T's OOT host1x-fence driver (/dev/host1x-fence) converts a syncpoint
+threshold to a sync_file (CREATE_FENCE) and back (FENCE_EXTRACT).
+Export: binary payload threshold is -local_offset; -1 when nothing is
+pending. Import: a single syncpoint fence becomes the sync's payload, so
+waits stay on the GPU; stub fences are signalled; anything else is
+waited on the CPU.
+
+Drop the opaque fd stubs, which only returned errors but made NVK
+advertise opaque fd semaphores.
+
+On by default; NVK_NVGPU_SYNC_FILE=0 disables it. One early test
+session hung the system (cause unknown, not reproduced since).
+---
+ include/drm-uapi/host1x-fence.h               |  96 +++++++++++++++++
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h  |   1 +
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     |   6 ++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c     | 101 +++++++++++++++---
+ 4 files changed, 192 insertions(+), 12 deletions(-)
+ create mode 100644 include/drm-uapi/host1x-fence.h
+
+diff --git a/include/drm-uapi/host1x-fence.h b/include/drm-uapi/host1x-fence.h
+new file mode 100644
+index 00000000000..ad01bc4a524
+--- /dev/null
++++ b/include/drm-uapi/host1x-fence.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/* Copyright (c) 2022 NVIDIA Corporation */
++
++#ifndef _UAPI__LINUX_HOST1X_FENCE_H
++#define _UAPI__LINUX_HOST1X_FENCE_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++struct host1x_create_fence {
++	/**
++	 * @id: [in]
++	 *
++	 * ID of the syncpoint to create a fence for.
++	 */
++	__u32 id;
++
++	/**
++	 * @threshold: [in]
++	 *
++	 * When the syncpoint reaches this value, the fence will be signaled.
++	 * The syncpoint is considered to have reached the threshold when the
++	 * following condition is true:
++	 *
++	 * 	((value - threshold) & 0x80000000U) == 0U
++	 *
++	 */
++	__u32 threshold;
++
++	/**
++	 * @fence_fd: [out]
++	 *
++	 * New sync_file file descriptor containing the created fence.
++	 */
++	__s32 fence_fd;
++
++	__u32 reserved[1];
++};
++
++struct host1x_fence_extract_fence {
++	__u32 id;
++	__u32 threshold;
++};
++
++struct host1x_fence_extract {
++	/**
++	 * @fence_fd: [in]
++	 *
++	 * sync_file file descriptor
++	 */
++	__s32 fence_fd;
++
++	/**
++	 * @num_fences: [in,out]
++	 *
++	 * In: size of the `fences_ptr` array counted in elements.
++	 * Out: required size of the `fences_ptr` array counted in elements.
++	 */
++	__u32 num_fences;
++
++	/**
++	 * @fences_ptr: [in]
++	 *
++	 * Pointer to array of `struct host1x_fence_extract_fence`.
++	 */
++	__u64 fences_ptr;
++
++	__u32 reserved[2];
++};
++
++struct host1x_create_pollfd {
++	__s32 fd;
++	__u32 reserved;
++};
++
++struct host1x_trigger_pollfd {
++	__s32 fd;
++	__u32 id;
++	__u32 threshold;
++	__u32 reserved;
++};
++
++#define HOST1X_IOCTL_CREATE_FENCE        _IOWR('X', 0x02, struct host1x_create_fence)
++#define HOST1X_IOCTL_FENCE_EXTRACT       _IOWR('X', 0x05, struct host1x_fence_extract)
++#define HOST1X_IOCTL_CREATE_POLLFD       _IOWR('X', 0x10, struct host1x_create_pollfd)
++#define HOST1X_IOCTL_TRIGGER_POLLFD      _IOWR('X', 0x11, struct host1x_trigger_pollfd)
++
++#if defined(__cplusplus)
++}
++#endif
++
++#endif
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index d4fb01d18b5..45084a92095 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -16,6 +16,7 @@ struct nvkmd_nvgpu_pdev {
+    int primary_fd;
+    int render_fd;
+    int ctrl_fd;
++   int host1x_fence_fd; /* /dev/host1x-fence: syncpoint <-> sync_file, or -1 */
+ 
+    struct vk_sync_type syncobj_sync_type;
+    const struct vk_sync_type *sync_types[2];
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index 9f4693afee7..e330ca0d458 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -327,6 +327,12 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+    pdev->primary_fd = -1;
+    pdev->render_fd = open(drm_device->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+ 
++   /* NVIDIA's OOT host1x-fence driver converts between syncpoint thresholds
++    * and sync_file fds; needed for VK_*_HANDLE_TYPE_SYNC_FD (WSI implicit
++    * sync, Android fences).  Optional.
++    */
++   pdev->host1x_fence_fd = open("/dev/host1x-fence", O_RDWR | O_CLOEXEC);
++
+    pdev->syncobj_sync_type = nvkmd_nvgpu_sync_get_type(pdev);
+    pdev->sync_types[0] = &pdev->syncobj_sync_type;
+    pdev->sync_types[1] = NULL;
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+index 631dbef2c19..9fef104934c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+@@ -4,7 +4,13 @@
+ #include "vk_log.h"
+ #include "vk_sync.h"
+ 
++#include "util/u_debug.h"
++
+ #include "drm-uapi/tegra_drm.h"
++#include "drm-uapi/host1x-fence.h"
++#include <poll.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
+ #include <errno.h>
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -166,22 +172,86 @@ nvkmd_nvgpu_sync_wait_many(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++/* Binary syncs are signalled with value 0, so the raw syncpoint threshold of
++ * the current payload is -local_offset (see nvkmd_nvgpu_exec_ctx_signal).
++ */
+ static VkResult
+-nvkmd_nvgpu_sync_import_opaque_fd(struct vk_device *device,
+-                                struct vk_sync *sync,
+-                                int fd)
++nvkmd_nvgpu_sync_export_sync_file(struct vk_device *device,
++                                  struct vk_sync *sync,
++                                  int *sync_file)
+ {
+-   return vk_errorf(device, VK_ERROR_UNKNOWN,
+-                    "sync_import_opaque_fd: not implemented");
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++   struct nvk_device *nvk_dev = container_of(device, struct nvk_device, vk);
++   struct nvkmd_nvgpu_pdev *pdev =
++      nvkmd_nvgpu_pdev(nvkmd_nvgpu_dev(nvk_dev->nvkmd)->base.pdev);
++
++   if (!sobj->initialized) {
++      /* Nothing pending: -1 is a valid, already-signalled sync file. */
++      *sync_file = -1;
++      return VK_SUCCESS;
++   }
++
++   struct host1x_create_fence args = {
++      .id = sobj->syncpoint_id,
++      .threshold = (uint32_t)(-sobj->local_offset),
++   };
++   if (ioctl(pdev->host1x_fence_fd, HOST1X_IOCTL_CREATE_FENCE, &args) == -1)
++      return vk_errorf(device, VK_ERROR_UNKNOWN,
++                       "HOST1X_IOCTL_CREATE_FENCE(%u, %u) failed: %m",
++                       args.id, args.threshold);
++
++   *sync_file = args.fence_fd;
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+-nvkmd_nvgpu_sync_export_opaque_fd(struct vk_device *device,
+-                                struct vk_sync *sync,
+-                                int *fd)
++nvkmd_nvgpu_sync_import_sync_file(struct vk_device *device,
++                                  struct vk_sync *sync,
++                                  int sync_file)
+ {
+-   return vk_errorf(device, VK_ERROR_UNKNOWN,
+-                    "sync_export_opaque_fd: not implemented");
++   struct nvkmd_nvgpu_sync *sobj = vk_sync_as_nvgpu_sync(sync);
++   struct nvk_device *nvk_dev = container_of(device, struct nvk_device, vk);
++   struct nvkmd_nvgpu_pdev *pdev =
++      nvkmd_nvgpu_pdev(nvkmd_nvgpu_dev(nvk_dev->nvkmd)->base.pdev);
++
++   if (sync_file < 0) {
++      sobj->initialized = false; /* signalled */
++      return VK_SUCCESS;
++   }
++
++   struct host1x_fence_extract_fence fences[8];
++   struct host1x_fence_extract args = {
++      .fence_fd = sync_file,
++      .num_fences = ARRAY_SIZE(fences),
++      .fences_ptr = (uintptr_t)fences,
++   };
++   if (ioctl(pdev->host1x_fence_fd, HOST1X_IOCTL_FENCE_EXTRACT, &args) == 0 &&
++       args.num_fences <= 1) {
++      if (args.num_fences == 0) {
++         sobj->initialized = false; /* stub / already signalled */
++      } else {
++         /* One host1x syncpoint threshold: GPU and CPU waits stay native. */
++         sobj->initialized = true;
++         sobj->syncpoint_id = fences[0].id;
++         sobj->local_offset = -(int64_t)fences[0].threshold;
++      }
++      return VK_SUCCESS;
++   }
++
++   /* Not syncpoint-backed (other driver) or several fences: wait on the CPU.
++    * Correct but synchronous; good enough until a real case shows up.
++    */
++   struct pollfd pfd = { .fd = sync_file, .events = POLLIN };
++   int ret;
++   do {
++      ret = poll(&pfd, 1, -1);
++   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++   if (ret != 1)
++      return vk_errorf(device, VK_ERROR_UNKNOWN,
++                       "waiting on imported sync file failed: %m");
++
++   sobj->initialized = false;
++   return VK_SUCCESS;
+ }
+ 
+ static VkResult
+@@ -213,8 +283,15 @@ nvkmd_nvgpu_sync_get_type(struct nvkmd_nvgpu_pdev *pdev)
+       .reset = nvkmd_nvgpu_sync_reset,
+       .move = nvkmd_nvgpu_sync_move,
+       .wait_many = nvkmd_nvgpu_sync_wait_many,
+-      .import_opaque_fd = nvkmd_nvgpu_sync_import_opaque_fd,
+-      .export_opaque_fd = nvkmd_nvgpu_sync_export_opaque_fd,
++      /* No opaque fd support: don't advertise it. */
+    };
++   /* On by default (Android needs sync_file). NVK_NVGPU_SYNC_FILE=0 turns it
++    * off: an earlier, unexplained system hang may have involved it.
++    */
++   if (pdev->host1x_fence_fd >= 0 &&
++       debug_get_bool_option("NVK_NVGPU_SYNC_FILE", true)) {
++      type.import_sync_file = nvkmd_nvgpu_sync_import_sync_file;
++      type.export_sync_file = nvkmd_nvgpu_sync_export_sync_file;
++   }
+    return type;
+ }
+-- 
+2.56.0
+
