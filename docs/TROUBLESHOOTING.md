@@ -46,6 +46,16 @@ Wiping Waydroid's data creates a new ID that must be registered again.
 - Release builds have assertions disabled. A `debugoptimized` build (`MESA_BUILDTYPE=debugoptimized
   build/mesa-android.sh`) turns invalid API usage into an abort with a message — useful for bug reports.
 
+## A game reacts to mouse clicks but not to drags, swipes or press-and-hold
+Waydroid passes the mouse to Android as a mouse. Many Unity games handle mouse clicks but read drags and
+swipes only from touch input. `persist.waydroid.fake_touch` makes Waydroid send the mouse as touch events
+for the listed apps. The installer sets it for The Tower (`FAKE_TOUCH_APPS` in lib/common.sh); for other
+games, as your normal user with Android running (comma-separated package names, `*` = all apps):
+```sh
+waydroid prop set persist.waydroid.fake_touch "com.TechTreeGames.TheTower,<other.package>"
+```
+Then restart the game. Multi-finger gestures (pinch-to-zoom) still don't work with a single mouse.
+
 ## Measuring FPS
 `tests/android-fps.sh` (copy to `~/.local/share/waydroid/data/local/tmp/`, run with
 `sudo waydroid shell -- sh /data/local/tmp/android-fps.sh "<layer>" 20`; the layer is the app's `(BLAST)`

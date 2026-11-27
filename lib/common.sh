@@ -9,6 +9,9 @@ L4T_TAG="R39 (release), REVISION: 2.0"
 KREL_STOCK=6.8.12-1021-tegra
 KREL=6.8.12-1021-tegra-waydroid
 WAYDROID_VERSION=1.6.3          # patches/waydroid/0001 is written against this version
+# Apps that get Waydroid's mouse-to-touch conversion (persist.waydroid.fake_touch, comma-separated). Unity games
+# like The Tower accept mouse clicks but ignore mouse drags/swipes. Only a default: `waydroid prop set` wins.
+FAKE_TOUCH_APPS=com.TechTreeGames.TheTower
 
 # Upstream sources (pinned + checksummed; used by build/fetch.sh).
 L4T_SOURCES_URL=https://developer.nvidia.com/downloads/embedded/l4t/r39_release_v2.0/sources/public_sources.tbz2

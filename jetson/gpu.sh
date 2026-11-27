@@ -6,6 +6,7 @@
 #           (/dev/nvgpu, /dev/nvmap, /dev/host1x-fence, all /dev/dri; permissions) — patches/waydroid/0001
 #        2) put our Mesa into the vendor overlay (/var/lib/waydroid/overlay/vendor/lib64)
 #        3) waydroid.cfg: render node of the NVIDIA display driver + gralloc/EGL/Vulkan/Mesa properties
+#           (+ the mouse-to-touch default persist.waydroid.fake_touch if unset, see lib/common.sh)
 #        4) waydroid upgrade --offline + restart the container service
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,8 +40,8 @@ render_node() {  # render node of the NVIDIA display controller (nv_platform, 13
 }
 
 cfg_edit() {  # cfg_edit apply <node> | undo
-  python3 - "$CFG" "$@" <<'EOF'
-import configparser, sys
+  FAKE_TOUCH_APPS=$FAKE_TOUCH_APPS python3 - "$CFG" "$@" <<'EOF'
+import configparser, os, sys
 path, mode = sys.argv[1], sys.argv[2]
 c = configparser.ConfigParser(); c.optionxform = str; c.read(path)
 ours = ["ro.hardware.gralloc", "ro.hardware.egl", "ro.hardware.vulkan", "gralloc.gbm.device",
@@ -55,6 +56,8 @@ if mode == "apply":
               "ro.hardware.vulkan": "nouveau", "gralloc.gbm.device": node,
               "debug.mesa.loader.driver.override": "zink", "debug.mesa.nvk.on.nvgpu": "1",
               "debug.mesa.nvk.i.want.a.broken.vulkan.driver": "1"})
+    # Not a GPU setting (kept by undo); only added if unset, for installs set up before 0.1.3.
+    p.setdefault("persist.waydroid.fake_touch", os.environ["FAKE_TOUCH_APPS"])
 else:
     for k in ours: p.pop(k, None)
     c["waydroid"].pop("drm_device", None)

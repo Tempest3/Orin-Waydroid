@@ -31,11 +31,12 @@ if [ ! -f /var/lib/waydroid/waydroid.cfg ]; then
   waydroid init -s GAPPS
   # init auto-picks /dev/dri/renderD128 (host1x, no Mesa driver) → SurfaceFlinger never starts.
   # Use software rendering until jetson/gpu.sh switches to the GPU.
-  python3 - /var/lib/waydroid/waydroid.cfg <<'PY'
-import configparser, sys
+  FAKE_TOUCH_APPS=$FAKE_TOUCH_APPS python3 - /var/lib/waydroid/waydroid.cfg <<'PY'
+import configparser, os, sys
 c = configparser.ConfigParser(); c.optionxform = str; c.read(sys.argv[1])
 if not c.has_section("properties"): c.add_section("properties")
 c["properties"].update({"ro.hardware.gralloc": "default", "ro.hardware.egl": "swiftshader"})
+c["properties"].setdefault("persist.waydroid.fake_touch", os.environ["FAKE_TOUCH_APPS"])
 with open(sys.argv[1], "w") as f: c.write(f)
 PY
   waydroid upgrade --offline >/dev/null

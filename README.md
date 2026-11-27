@@ -67,6 +67,8 @@ The first start downloads Play Store / Play Services updates; let them finish be
 - **GPU** — a small patch to Waydroid's LXC setup to pass the Orin GPU devices into the container,
   our Mesa build in Waydroid's vendor overlay (`/var/lib/waydroid/overlay/vendor/lib64`) and the
   matching Android properties in `/var/lib/waydroid/waydroid.cfg` (backup: `waydroid.cfg.pre-orin-waydroid`).
+- **Input** — mouse-to-touch conversion (`persist.waydroid.fake_touch`) for The Tower, whose drags and swipes
+  otherwise ignore the mouse; only set if you haven't set it yourself (docs/TROUBLESHOOTING.md).
 
 Details: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md). Problems: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
