@@ -1,0 +1,193 @@
+From 0ea1e45ea518b6957d701a100de17bf2bfb50315 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 01:28:15 -0500
+Subject: [PATCH] nvk,nvkmd/nvgpu: compress sub-allocated images
+
+NVK only compresses images with a dedicated allocation, because nouveau
+must pin compressed memory in VRAM.  Engines that sub-allocate (3DMark
+Wild Life Extreme: all its 4K render targets) were never compressed.
+
+nvgpu memory is all sysmem, so nothing needs pinning.  With the new
+kmd_info.has_compression_suballoc (nvgpu only;
+NVK_NVGPU_COMPRESSION_SUBALLOC=0 disables it):
+- compressible images get 64K (compression page) plane alignment, so a
+  compressible fixed-address map has VA == offset mod 64K;
+- a non-dedicated bind at a 64K-aligned offset uses a VA with the
+  compressed PTE kind and marks the image compressed;
+- plain nvgpu allocations are no longer registered, so nvgpu allocates
+  comptags lazily on the first compressible map (it only does that for
+  unregistered buffers).  Imports were already unregistered.
+
+vkperf with all images in one 1 GiB block at non-zero offsets: blend
+10.7 -> 14.5 GPix/s, depth-write 7.1 -> 14.5.  zcheck and scheck pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_image.c                | 41 ++++++++++++++++---
+ src/nouveau/vulkan/nvk_image.h                |  3 ++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c      | 11 ++++-
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     |  7 ++++
+ src/nouveau/vulkan/nvkmd/nvkmd.h              |  4 ++
+ 5 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index e10a6d03cd6..9c253a0017a 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -1164,6 +1164,11 @@ nvk_image_init(struct nvk_device *dev,
+       uint32_t plane_align_B = image->planes[plane].nil.align_B;
+       if (sparse_bound || image->planes[plane].nil.pte_kind)
+          plane_align_B = MAX2(plane_align_B, pdev->nvkmd->bind_align_B);
++      /* Sub-allocated compressed images: a compressible fixed-address map
++       * needs VA == memory offset modulo the 64K compression page.
++       */
++      if (image->can_compress && pdev->nvkmd->kmd_info.has_compression_suballoc)
++         plane_align_B = MAX2(plane_align_B, NVK_COMPRESSION_PAGE_B);
+       image->planes[plane].plane_align_B = plane_align_B;
+       image->image_align_B = MAX2(plane_align_B, image->image_align_B);
+ 
+@@ -1208,9 +1213,10 @@ nvk_image_init(struct nvk_device *dev,
+ }
+ 
+ static VkResult
+-nvk_image_plane_alloc_va(struct nvk_device *dev,
+-                         const struct nvk_image *image,
+-                         struct nvk_image_plane *plane)
++nvk_image_plane_alloc_va_kind(struct nvk_device *dev,
++                              const struct nvk_image *image,
++                              struct nvk_image_plane *plane,
++                              uint8_t pte_kind)
+ {
+    assert(plane->va == NULL);
+    VkResult result;
+@@ -1221,7 +1227,7 @@ nvk_image_plane_alloc_va(struct nvk_device *dev,
+       image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+    assert(sparse_bound || !sparse_resident);
+ 
+-   if (sparse_bound || plane->nil.pte_kind) {
++   if (sparse_bound || pte_kind) {
+       enum nvkmd_va_flags va_flags = 0;
+       if (sparse_resident)
+          va_flags |= NVKMD_VA_SPARSE;
+@@ -1230,7 +1236,7 @@ nvk_image_plane_alloc_va(struct nvk_device *dev,
+       const uint64_t va_size_B = align64(plane->nil.size_B, va_align_B);
+ 
+       result = nvkmd_dev_alloc_va(dev->nvkmd, &dev->vk.base,
+-                                  va_flags, plane->nil.pte_kind,
++                                  va_flags, pte_kind,
+                                   va_size_B, va_align_B,
+                                   0 /* fixed_addr */, &plane->va);
+       if (result != VK_SUCCESS)
+@@ -1242,6 +1248,14 @@ nvk_image_plane_alloc_va(struct nvk_device *dev,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++nvk_image_plane_alloc_va(struct nvk_device *dev,
++                         const struct nvk_image *image,
++                         struct nvk_image_plane *plane)
++{
++   return nvk_image_plane_alloc_va_kind(dev, image, plane, plane->nil.pte_kind);
++}
++
+ static void
+ nvk_image_plane_finish(struct nvk_device *dev,
+                        struct nvk_image_plane *plane,
+@@ -1655,9 +1669,24 @@ nvk_image_plane_bind(struct nvk_device *dev,
+          image->is_compressed = true;
+          plane->addr = mem->mem->va->addr + offset_B;
+       } else {
+-         VkResult result = nvk_image_plane_alloc_va(dev, image, plane);
++         /* Sub-allocated compression (nvgpu): bind through a VA with the
++          * compressible kind; the kernel allocates comptags for the memory
++          * object on first compressible map.
++          */
++         const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++         const bool compress =
++            image->can_compress && not_shared &&
++            pdev->nvkmd->kmd_info.has_compression_suballoc &&
++            plane == &image->planes[0] && image->plane_count == 1 &&
++            plane->nil.compressed_pte_kind != 0 &&
++            offset_B % NVK_COMPRESSION_PAGE_B == 0;
++
++         VkResult result = nvk_image_plane_alloc_va_kind(dev, image, plane,
++            compress ? plane->nil.compressed_pte_kind : plane->nil.pte_kind);
+          if (result != VK_SUCCESS)
+             return result;
++         if (compress)
++            image->is_compressed = true;
+ 
+          result = nvkmd_va_bind_mem(plane->va, &image->vk.base, 0,
+                                     mem->mem, offset_B,
+diff --git a/src/nouveau/vulkan/nvk_image.h b/src/nouveau/vulkan/nvk_image.h
+index b3330ac1c04..49cda6c6797 100644
+--- a/src/nouveau/vulkan/nvk_image.h
++++ b/src/nouveau/vulkan/nvk_image.h
+@@ -93,6 +93,9 @@ struct nvk_zcull_plane {
+    uint64_t plane_offset_B;
+ };
+ 
++/* Compression page (comptag granularity) for sub-allocated compressed images */
++#define NVK_COMPRESSION_PAGE_B (64u * 1024u)
++
+ struct nvk_image {
+    struct vk_image vk;
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index f3270903399..5cdc07aa661 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -198,7 +198,16 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+                                 NVGPU_GPU_COMPTAGS_ALLOC_REQUESTED :
+                                 NVGPU_GPU_COMPTAGS_ALLOC_NONE,
+    };
+-   if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_REGISTER_BUFFER, &register_args) == -1) {
++   /* Plain memory may later back sub-allocated compressed images.  nvgpu
++    * only allocates comptags lazily (on the first compressible map) for
++    * buffers that were never registered, so don't register those at all;
++    * imports are unregistered too and map fine.
++    */
++   const bool do_register =
++      register_args.comptags_alloc_control != NVGPU_GPU_COMPTAGS_ALLOC_NONE ||
++      !dev->base.pdev->kmd_info.has_compression_suballoc;
++   if (do_register &&
++       ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_REGISTER_BUFFER, &register_args) == -1) {
+       printf("failed to NVGPU_GPU_IOCTL_REGISTER_BUFFER: %d\n", errno);
+       close(get_fd_args.fd);
+       ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, (unsigned long)handle);
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index 664f1d1a395..4a5c53b0f70 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -346,6 +346,13 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+                          chars.threed_class >= 0xc597 /* TURING_A kinds */ &&
+                          debug_get_bool_option("NVK_NVGPU_COMPRESSION", true),
+    };
++   /* Everything is sysmem, so compressing sub-allocated images has none of
++    * nouveau's VRAM-pinning concerns.  NVK_NVGPU_COMPRESSION_SUBALLOC=0
++    * limits compression to dedicated allocations (upstream behaviour).
++    */
++   pdev->base.kmd_info.has_compression_suballoc =
++      pdev->base.kmd_info.has_compression &&
++      debug_get_bool_option("NVK_NVGPU_COMPRESSION_SUBALLOC", true);
+ 
+    // XXX is this correct?
+    uint64_t os_page_size;
+diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
+index 6527799f113..40e47b8c190 100644
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+@@ -129,6 +129,10 @@ struct nvkmd_info {
+    bool has_map_fixed;
+    bool has_overmap;
+    bool has_compression;
++   /* Compression also works for images bound into a sub-range of a larger
++    * allocation (needs 64K-aligned offsets; nvgpu: no VRAM pinning issue).
++    */
++   bool has_compression_suballoc;
+ };
+ 
+ struct nvkmd_pdev_ops {
+-- 
+2.56.1
+

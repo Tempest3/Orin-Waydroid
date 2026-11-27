@@ -12,7 +12,9 @@ and Zink), using the stock JetPack driver stack and no proprietary Android blobs
 | Result | Play Store sign-in works; Unity game *The Tower*: 60 FPS (vsync-locked), GPU ≈ 30–50 % |
 
 > **Experimental.** NVK on nvgpu is an out-of-tree Mesa backend
-> ([MR 34914](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34914)) plus 18 patches of ours (24 in total).
+> ([MR 34914](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34914)) plus 25 patches of ours (31 in total).
+> **This is the `performance` branch:** Mesa patches 0025–0031 (ZCULL, compression, a NAK fix) on top of release
+> 0.1.1. There are no release tarballs for it; build it yourself (see below). Details: docs/HOW-IT-WORKS.md.
 > It is not a conformant Vulkan driver. Expect bugs; keep backups of anything important.
 
 ## Quick start (on the Jetson)

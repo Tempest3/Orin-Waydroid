@@ -1,0 +1,122 @@
+From 3eb88cd2ff746f41db261f50dec2eb763a7ba349 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 00:38:50 -0500
+Subject: [PATCH] nvkmd/nvgpu: enable compression
+
+Report has_compression when nvgpu has NVGPU_GPU_FLAGS_SUPPORT_COMPRESSION
+(Turing+ kinds; NVK_NVGPU_COMPRESSION=0 disables it).  ga10b allows
+compressible kinds on 4K pages, so the missing GPU IOMMU (no big pages) is
+not a blocker.  Tiled allocations with a compressible kind are registered
+with NVGPU_GPU_COMPTAGS_ALLOC_REQUESTED, so nvgpu allocates and clears
+comptags at map time, and are mapped with compr_kind = the VA kind and
+incompr_kind = its uncompressed equivalent as the fallback.
+
+Orin Nano, 2560x1440 (GPix/s, before -> after; NVIDIA blob):
+  blend        10.7 -> 14.5  (14.4)
+  depth-write   7.1 -> 14.5  (14.5)
+  depth-reject  128 -> 181   (196)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h   | 18 ++++++++++++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c       |  8 ++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c      |  7 +++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c        | 12 ++++++++++--
+ 4 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+index cc2ca66ceff..b7a6ff570e4 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu.h
+@@ -75,6 +75,24 @@ struct nvkmd_nvgpu_mem {
+ };
+ NVKMD_DECL_SUBCLASS(mem, nvgpu);
+ 
++/* Turing+ compressible PTE kind -> its uncompressed equivalent (the fallback
++ * nvgpu uses when no comptags are available).  Returns 0 if not compressible.
++ */
++static inline uint8_t
++nvkmd_nvgpu_pte_kind_uncompressed(uint8_t kind)
++{
++   switch (kind) {
++   case 0x08: /* GENERIC_MEMORY_COMPRESSIBLE */
++   case 0x09: return 0x06; /* ..._DISABLE_PLC -> GENERIC_MEMORY */
++   case 0x0a: return 0x02; /* S8 */
++   case 0x0b: return 0x01; /* Z16 */
++   case 0x0c: return 0x03; /* S8Z24 */
++   case 0x0d: return 0x04; /* ZF32_X24S8 */
++   case 0x0e: return 0x05; /* Z24S8 */
++   default:   return 0;
++   }
++}
++
+ /* Returns a new dma-buf fd for mem (caller closes), or -1 with errno set. */
+ int nvkmd_nvgpu_mem_get_dmabuf_fd(struct nvkmd_nvgpu_mem *mem);
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index 1fd730b9b80..f3270903399 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -187,8 +187,16 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+       return VK_ERROR_UNKNOWN;
+    }
+ 
++   /* Compressible kinds need comptags; nvgpu only allocates them at map
++    * time for buffers registered with a comptags request.  REQUESTED (not
++    * REQUIRED): if the CBC runs out, the map falls back to the uncompressed
++    * kind.
++    */
+    struct nvgpu_gpu_register_buffer_args register_args = {
+       .dmabuf_fd = get_fd_args.fd,
++      .comptags_alloc_control = nvkmd_nvgpu_pte_kind_uncompressed(pte_kind) ?
++                                NVGPU_GPU_COMPTAGS_ALLOC_REQUESTED :
++                                NVGPU_GPU_COMPTAGS_ALLOC_NONE,
+    };
+    if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_REGISTER_BUFFER, &register_args) == -1) {
+       printf("failed to NVGPU_GPU_IOCTL_REGISTER_BUFFER: %d\n", errno);
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index ef9a7a275f6..664f1d1a395 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -338,6 +338,13 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+       .has_alloc_tiled = true,// nouveau_ws_device_has_tiled_bo(ws_dev),
+       .has_map_fixed = true,
+       .has_overmap = true,
++      /* Compressed PTE kinds work with 4K pages on gp10b+ (nvgpu
++       * compressible_page_size); comptags come from the CBC backing store.
++       * NVK_NVGPU_COMPRESSION=0 disables it.
++       */
++      .has_compression = (chars.flags & NVGPU_GPU_FLAGS_SUPPORT_COMPRESSION) &&
++                         chars.threed_class >= 0xc597 /* TURING_A kinds */ &&
++                         debug_get_bool_option("NVK_NVGPU_COMPRESSION", true),
+    };
+ 
+    // XXX is this correct?
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index d4c04499cba..5a1f92dcf94 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -276,10 +276,18 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    if (mem->base.flags & NVKMD_MEM_COHERENT)
+       flags |= NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT;
+ 
++   /* A compressible VA kind maps compressed when the buffer has comptags
++    * (registered with a request, see alloc_tiled_mem), else nvgpu falls back
++    * to the uncompressed kind.
++    */
++   const uint8_t uncompr = nvkmd_nvgpu_pte_kind_uncompressed(va->base.pte_kind);
++   const int16_t compr_kind = uncompr ? va->base.pte_kind : NV_KIND_INVALID;
++   const int16_t incompr_kind = uncompr ? uncompr : va->base.pte_kind;
++
+    struct nvgpu_as_map_buffer_ex_args map_buffer_args = {
+       .flags = flags,
+-      .compr_kind = NV_KIND_INVALID,
+-      .incompr_kind = va->base.pte_kind,
++      .compr_kind = compr_kind,
++      .incompr_kind = incompr_kind,
+       .dmabuf_fd = dmabuf_fd,
+       .page_size = 4096, // xxx
+       .buffer_offset = mem_offset_B,
+-- 
+2.56.1
+

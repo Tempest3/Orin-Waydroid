@@ -47,6 +47,24 @@ same module set swapped in (so no NVIDIA initrd is redistributed).
 | 0019–0020 | fault triage: SM error state + faulting PC logging; NAK debug output on Android |
 | 0021 | tolerate unaligned flush ranges (Unity) instead of asserting |
 | 0022 | invalidate the GPU L2's sysmem lines before every submission: Orin's L2 does not snoop CPU writes and nvgpu never invalidates it, so CPU-updated buffers were otherwise read stale indefinitely |
+| 0023 | tolerate 3D views of single-layer 2D images (3DMark Wild Life Extreme aborted in NIL) |
+| 0024 | `NVMAP_IOC_FREE` takes the handle, not a pointer: every freed allocation leaked (gralloc grew until lmkd killed apps) |
+
+### Performance work (branch `performance`, not in a release yet)
+
+Measured on an Orin Nano at 25 W with a microbenchmark against NVIDIA's own Vulkan driver on the same board, and with
+3DMark Wild Life Extreme (WLE) in Waydroid. WLE: about 1830 → about 1930, all of it from ZCULL.
+
+| Patch | Change | Effect |
+|---|---|---|
+| 0025 | enable ZCULL: report ZCULL geometry from `ZCULL_GET_INFO`/`GET_CTX_SIZE`; fix the ZCULL bind, which passed the mode constant as the ioctl number, so it returned 0 without binding anything | occluded-pixel rejection 14 → 121 GPix/s (NVIDIA 196); WLE +5 % |
+| 0026 | NAK: reuse a block's legalizer copies of immediates/cbuf values instead of a `mov` before every FFMA | `x*uniform+imm` ALU throughput +43 %; no WLE change |
+| 0027 | compression: comptags requested at register for compressible kinds; map with compressed + uncompressed fallback kind (4K pages are fine on ga10b) | blend 10.7 → 14.5, depth write 7.1 → 14.5 GPix/s (= NVIDIA) |
+| 0028 | `NVK_NVGPU_SHADER_UNCACHED=0` (`debug.mesa.nvk.nvgpu.shader.uncached=false`) maps the shader heap L2-cached, for measuring | default unchanged (uncached); no measurable WLE difference |
+| 0029 | report `HOST_TRANSFER` usage as non-optimal for compressible images, so Zink drops it and its render targets get compressed | Zink color targets compressed |
+| 0030, 0031 | compression for sub-allocated images (64K-aligned binds; plain buffers left unregistered so nvgpu allocates comptags lazily); **off by default** (0031), `NVK_NVGPU_COMPRESSION_SUBALLOC=1` enables it | −1 % in WLE when on |
+
+Off switches: `NVK_NVGPU_ZCULL=0`, `NVK_NVGPU_COMPRESSION=0` (Android: `debug.mesa.nvk.nvgpu.zcull=false`, etc.).
 
 ## Waydroid integration
 

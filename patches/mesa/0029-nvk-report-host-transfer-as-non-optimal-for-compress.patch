@@ -1,0 +1,52 @@
+From e56614ff38f017d1b3e7c8ed9b7bf31e0896e8de Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 01:16:19 -0500
+Subject: [PATCH] nvk: report host transfer as non-optimal for compressible
+ images
+
+VK_IMAGE_USAGE_HOST_TRANSFER_BIT disables compression
+(nvk_image_can_compress), yet NVK always reported optimalDeviceAccess =
+true.  Zink adds HOST_TRANSFER to every image when it can, and only
+drops it when the driver says that access is not optimal, so no Zink
+render target was ever compressed.  Report optimalDeviceAccess =
+identicalMemoryLayout = false for images that would otherwise be
+compressed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_image.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index 505f126a3e3..e10a6d03cd6 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -677,8 +677,23 @@ nvk_GetPhysicalDeviceImageFormatProperties2(
+       }
+       case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT: {
+          VkHostImageCopyDevicePerformanceQueryEXT *host_props = s;
+-         host_props->optimalDeviceAccess = true;
+-         host_props->identicalMemoryLayout = true;
++         /* HOST_TRANSFER usage disables compression (nvk_image_can_compress),
++          * so for images that would otherwise be compressed it is NOT optimal.
++          * Saying so lets Zink (which adds HOST_TRANSFER to every image when
++          * it can) drop the usage and get compressed render targets.
++          */
++         const bool would_compress =
++            pdev->nvkmd->kmd_info.has_compression &&
++            !(pdev->debug_flags & NVK_DEBUG_NO_COMPRESSION) &&
++            pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
++            ycbcr_info == NULL &&
++            !(pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                                         VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) &&
++            (all_usage & (VK_IMAGE_USAGE_STORAGE_BIT |
++                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
++         host_props->optimalDeviceAccess = !would_compress;
++         host_props->identicalMemoryLayout = !would_compress;
+          break;
+       }
+       default:
+-- 
+2.56.1
+
