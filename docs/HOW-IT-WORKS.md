@@ -47,6 +47,8 @@ same module set swapped in (so no NVIDIA initrd is redistributed).
 | 0019–0020 | fault triage: SM error state + faulting PC logging; NAK debug output on Android |
 | 0021 | tolerate unaligned flush ranges (Unity) instead of asserting |
 | 0022 | invalidate the GPU L2's sysmem lines before every submission: Orin's L2 does not snoop CPU writes and nvgpu never invalidates it, so CPU-updated buffers were otherwise read stale indefinitely |
+| 0023 | tolerate 3D views of single-layer 2D images (3DMark Wild Life Extreme aborted in NIL) |
+| 0024 | `NVMAP_IOC_FREE` takes the handle, not a pointer: every freed allocation leaked (gralloc grew until lmkd killed apps) |
 
 ## Waydroid integration
 
