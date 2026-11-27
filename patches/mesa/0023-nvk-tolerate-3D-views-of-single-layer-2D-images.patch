@@ -1,0 +1,66 @@
+From 3e67b45cd0d5ad9c6fb0cfde335bc32aeb8ab2c2 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 23:06:18 -0500
+Subject: [PATCH] nvk: tolerate 3D views of single-layer 2D images
+
+3DMark Wild Life Extreme intermittently creates a VK_IMAGE_VIEW_TYPE_3D
+view of a 32x32 2D SRGB texture while loading. This is invalid usage, but
+other drivers accept it, while NIL aborts in normalize_extent. Describe a
+single-layer tiled 1D/2D image as a 3D image of depth 1, which has the same
+layout. Otherwise fall back to a 2D view.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_image_view.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/nouveau/vulkan/nvk_image_view.c b/src/nouveau/vulkan/nvk_image_view.c
+index 60ca49ae630..07caa44e6d4 100644
+--- a/src/nouveau/vulkan/nvk_image_view.c
++++ b/src/nouveau/vulkan/nvk_image_view.c
+@@ -12,6 +12,7 @@
+ #include "nvk_physical_device.h"
+ 
+ #include "vk_format.h"
++#include "util/log.h"
+ 
+ #include "clb097.h"
+ 
+@@ -181,6 +182,34 @@ nvk_image_view_init_no_alloc(struct nvk_device *dev,
+          nil_view.view_type != NIL_VIEW_TYPE_3D)
+          image_3d_view_as_2d_array(&nil_image, &nil_view, &base_addr);
+ 
++      /* A VK_IMAGE_VIEW_TYPE_3D view of a 1D/2D image is invalid usage, but
++       * some apps do it (3DMark Wild Life Extreme, intermittently while
++       * loading: a 32x32 2D texture) and other drivers tolerate it.  NIL
++       * asserts on it.  A single-layer tiled 1D/2D image has the layout of a
++       * 3D image with depth 1 (the tiling comes from the levels), so describe
++       * it that way and the shader's 3D sampling still matches.  Otherwise
++       * fall back to a 2D view.
++       */
++      if (nil_view.view_type == NIL_VIEW_TYPE_3D &&
++          nil_image.dim != NIL_IMAGE_DIM_3D) {
++         static bool warned;
++         if (!warned) {
++            warned = true;
++            mesa_logw("nvk: 3D view of a %uD image (invalid usage); "
++                      "treating it as depth 1", (unsigned)nil_image.dim);
++         }
++         if (nil_image.extent_px.array_len == 1 &&
++             nil_image.extent_px.depth == 1 &&
++             nil_image.levels[0].tiling.gob_type != NIL_GOB_TYPE_LINEAR) {
++            nil_image.dim = NIL_IMAGE_DIM_3D;
++            nil_view.base_array_layer = 0;
++            nil_view.array_len = 1;
++         } else {
++            nil_view.view_type = nil_image.dim == NIL_IMAGE_DIM_1D ?
++                                 NIL_VIEW_TYPE_1D : NIL_VIEW_TYPE_2D;
++         }
++      }
++
+       view->planes[view_plane].sample_layout = nil_image.sample_layout;
+ 
+       if (view->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
+-- 
+2.56.1
+

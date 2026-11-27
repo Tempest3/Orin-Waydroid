@@ -1,0 +1,68 @@
+From 93a81613677ba14552b908c812a5f3714b3c2a96 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Thu, 26 Nov 2026 23:40:47 -0500
+Subject: [PATCH] nvkmd/nvgpu: pass the handle, not a pointer to it, to
+ NVMAP_IOC_FREE
+
+NVMAP_IOC_FREE is _IO and nvmap uses the ioctl argument as the handle.
+Passing &mem->nvmap_handle made nvmap look up a handle numbered by the
+pointer value, so nothing was ever freed. Every nvmap allocation leaked
+until process exit. Long-lived processes leaked without bound: the
+Waydroid gralloc allocator lost about 9 MiB per window buffer, until lmkd
+killed the foreground app.
+
+Also free the handle on the error paths after NVMAP_IOC_CREATE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+index d9c2dc6546b..1fd730b9b80 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_mem.c
+@@ -174,7 +174,8 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    };
+    if (ioctl(dev->nvmap_fd, NVMAP_IOC_ALLOC, &alloc_args) == -1) {
+       printf("failed to NVMAP_IOC_ALLOC: %d\n", errno);
+-      return VK_ERROR_UNKNOWN;
++      ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, (unsigned long)handle);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+ 
+    struct nvmap_create_handle get_fd_args = {
+@@ -182,6 +183,7 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    };
+    if (ioctl(dev->nvmap_fd, NVMAP_IOC_GET_FD, &get_fd_args) == -1) {
+       printf("failed to NVMAP_IOC_GET_FD: %d\n", errno);
++      ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, (unsigned long)handle);
+       return VK_ERROR_UNKNOWN;
+    }
+ 
+@@ -190,6 +192,8 @@ nvkmd_nvgpu_alloc_tiled_mem(struct nvkmd_dev *_dev,
+    };
+    if (ioctl(dev->ctrl_fd, NVGPU_GPU_IOCTL_REGISTER_BUFFER, &register_args) == -1) {
+       printf("failed to NVGPU_GPU_IOCTL_REGISTER_BUFFER: %d\n", errno);
++      close(get_fd_args.fd);
++      ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, (unsigned long)handle);
+       return VK_ERROR_UNKNOWN;
+    }
+    close(get_fd_args.fd);
+@@ -301,7 +305,12 @@ nvkmd_nvgpu_mem_free(struct nvkmd_mem *_mem)
+    nvkmd_va_free(mem->base.va);
+    if (mem->dmabuf_fd >= 0) {
+       close(mem->dmabuf_fd);
+-   } else if (ioctl(dev->nvmap_fd, NVMAP_IOC_FREE, &mem->nvmap_handle) == -1) {
++   } else if (ioctl(dev->nvmap_fd, NVMAP_IOC_FREE,
++                    (unsigned long)mem->nvmap_handle) == -1) {
++      /* NVMAP_IOC_FREE is _IO: the argument is the handle itself, not a
++       * pointer to it.  Passing a pointer frees nothing, so every nvmap
++       * allocation leaked until process exit.
++       */
+       printf("failed NVMAP_IOC_FREE: %d\n", errno);
+    }
+    FREE(mem);
+-- 
+2.56.1
+
