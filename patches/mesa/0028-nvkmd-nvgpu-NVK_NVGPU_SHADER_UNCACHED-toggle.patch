@@ -1,0 +1,48 @@
+From 042eda45b56c3a6f339c1a56f15b63531a10850e Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 00:43:20 -0500
+Subject: [PATCH] nvkmd/nvgpu: NVK_NVGPU_SHADER_UNCACHED toggle
+
+0018 maps the shader heap GPU-uncached because L2 used to keep stale
+CPU-written lines.  0022 now invalidates L2 at the start of every
+submit, which may make that unnecessary.  Add a toggle to map it cached
+(NVK_NVGPU_SHADER_UNCACHED=0; Android: debug.mesa.nvk.nvgpu.shader.uncached)
+so the cost can be measured.  The default is unchanged (uncached).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+index 5a1f92dcf94..17cf667c599 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_va.c
+@@ -11,6 +11,7 @@
+ #include "drm-uapi/nvmap.h"
+ #include "nvkmd/nvkmd.h"
+ #include "util/bitscan.h"
++#include "util/u_debug.h"
+ #include "vulkan/vulkan_core.h"
+ #include <sys/ioctl.h>
+ #include "vk_log.h"
+@@ -271,7 +272,15 @@ nvkmd_nvgpu_va_bind_mem(struct nvkmd_va *_va,
+    __u32 flags = NVGPU_AS_MAP_BUFFER_FLAGS_FIXED_OFFSET | NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
+    /* GPU L2 does not snoop CPU writes to sysmem and nvgpu does not invalidate
+     * L2 on submit, so CPU-written data must bypass L2 (see NVKMD_MEM_GPU_UNCACHED). */
+-   if (mem->base.flags & NVKMD_MEM_GPU_UNCACHED)
++   /* Since 0022 invalidates L2 at the start of every submit, a CPU upload is
++    * visible to the next submit even through L2, so this may no longer be
++    * needed.  NVK_NVGPU_SHADER_UNCACHED=0 (Android:
++    * debug.mesa.nvk.nvgpu.shader.uncached=false) maps it cached, to measure.
++    */
++   static int shader_uncached = -1; /* benign race: same value either way */
++   if (shader_uncached < 0)
++      shader_uncached = debug_get_bool_option("NVK_NVGPU_SHADER_UNCACHED", true);
++   if ((mem->base.flags & NVKMD_MEM_GPU_UNCACHED) && shader_uncached)
+       flags &= ~NVGPU_AS_MAP_BUFFER_FLAGS_CACHEABLE;
+    if (mem->base.flags & NVKMD_MEM_COHERENT)
+       flags |= NVGPU_AS_MAP_BUFFER_FLAGS_SYSTEM_COHERENT;
+-- 
+2.56.1
+

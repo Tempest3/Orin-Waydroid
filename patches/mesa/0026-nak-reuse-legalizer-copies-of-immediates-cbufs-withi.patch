@@ -1,0 +1,121 @@
+From 426fe19be03a7a7559f3fa6c4a8dc8967957b6ec Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 00:21:34 -0500
+Subject: [PATCH] nak: reuse legalizer copies of immediates/cbufs within a
+ block
+
+When an instruction can't encode an immediate or cbuf source, legalize
+copies it to a register.  It did so once per instruction, so e.g.
+`a * uniform + 0.5` emitted a fresh `mov r, 0.5` before every FFMA.
+Keep a per-block cache keyed by (SrcRef, RegFile) and re-use the earlier
+copy, which dominates: it is in the same block, before its first user,
+and unpredicated.
+
+Orin Nano (GA10B), vkperf alu (8x vec4 FFMA chains, uniform*x+0.5):
+815 -> 1162 GFLOP/s, equal to the register-addend case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/compiler/nak/legalize.rs | 36 +++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/legalize.rs b/src/nouveau/compiler/nak/legalize.rs
+index 137e00e0088..6845e4cacec 100644
+--- a/src/nouveau/compiler/nak/legalize.rs
++++ b/src/nouveau/compiler/nak/legalize.rs
+@@ -65,7 +65,12 @@ pub enum PadValue {
+     Undefined,
+ }
+ 
++/// Per-block cache of legalizer copies of immediates/cbuf values.
++pub type CopyCache = FxHashMap<(SrcRef, RegFile), SSAValue>;
++
+ pub trait LegalizeBuildHelpers: SSABuilder {
++    fn copy_cache(&mut self) -> &mut CopyCache;
++
+     fn copy_ssa(&mut self, ssa: &mut SSAValue, reg_file: RegFile) {
+         let tmp = self.alloc_ssa(reg_file);
+         self.copy_to(tmp.into(), (*ssa).into());
+@@ -190,9 +195,29 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+             }));
+         }
+ 
++        // Re-use an earlier legalizer copy of the same immediate or cbuf
++        // value in this block instead of emitting another one.  Without
++        // this, e.g. `x * uniform + 0.5` in a loop got a fresh `mov r, 0.5`
++        // before every FFMA, halving ALU throughput.  The earlier copy
++        // dominates: same block, emitted unpredicated before its first user.
++        let cacheable = val.comps() == 1
++            && src_type != SrcType::Pred
++            && matches!(src.src_ref, SrcRef::Imm32(_) | SrcRef::CBuf(_));
++        if cacheable {
++            if let Some(cached) =
++                self.copy_cache().get(&(src.src_ref.clone(), reg_file))
++            {
++                src.src_ref = (*cached).into();
++                return;
++            }
++        }
++
+         let old_src_ref =
+             std::mem::replace(&mut src.src_ref, val.clone().into());
+         if val.comps() == 1 {
++            if cacheable {
++                self.copy_cache().insert((old_src_ref.clone(), reg_file), val[0]);
++            }
+             self.copy_to(val[0].into(), old_src_ref.into());
+         } else {
+             match old_src_ref {
+@@ -396,6 +421,7 @@ pub trait LegalizeBuildHelpers: SSABuilder {
+ pub struct LegalizeBuilder<'a> {
+     b: SSAInstrBuilder<'a>,
+     const_tracker: &'a mut ConstTracker,
++    copy_cache: &'a mut CopyCache,
+ }
+ 
+ impl<'a> LegalizeBuilder<'a> {
+@@ -403,10 +429,12 @@ impl<'a> LegalizeBuilder<'a> {
+         sm: &'a ShaderModelInfo,
+         alloc: &'a mut SSAValueAllocator,
+         const_tracker: &'a mut ConstTracker,
++        copy_cache: &'a mut CopyCache,
+     ) -> Self {
+         LegalizeBuilder {
+             b: SSAInstrBuilder::new(sm, alloc),
+             const_tracker,
++            copy_cache,
+         }
+     }
+ 
+@@ -451,7 +479,11 @@ impl<'a> SSABuilder for LegalizeBuilder<'a> {
+     }
+ }
+ 
+-impl LegalizeBuildHelpers for LegalizeBuilder<'_> {}
++impl LegalizeBuildHelpers for LegalizeBuilder<'_> {
++    fn copy_cache(&mut self) -> &mut CopyCache {
++        self.copy_cache
++    }
++}
+ 
+ fn legalize_instr(
+     sm: &ShaderModelInfo,
+@@ -600,6 +632,7 @@ impl Shader<'_> {
+                 let bu = b.uniform;
+ 
+                 let mut instrs = Vec::new();
++                let mut copy_cache = CopyCache::default();
+                 for (ip, mut instr) in b.instrs.drain(..).enumerate() {
+                     match &instr.op {
+                         Op::Pin(pin) => {
+@@ -617,6 +650,7 @@ impl Shader<'_> {
+                         sm,
+                         &mut f.ssa_alloc,
+                         &mut const_tracker,
++                        &mut copy_cache,
+                     );
+                     legalize_instr(sm, &mut b, bl, bu, &pinned, ip, &mut instr);
+                     b.push_instr(instr);
+-- 
+2.56.1
+

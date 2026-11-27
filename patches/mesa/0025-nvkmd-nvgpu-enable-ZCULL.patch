@@ -1,0 +1,130 @@
+From 33b5aa44ac319808eba346f525533e6657961062 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 00:18:26 -0500
+Subject: [PATCH] nvkmd/nvgpu: enable ZCULL
+
+NVK only uses ZCULL when nv_device_info.has_zcull_info is set, and only
+the nouveau winsys set it, so ZCULL was off on nvgpu. Fill zcull_info
+from NVGPU_GPU_IOCTL_ZCULL_GET_INFO and ZCULL_GET_CTX_SIZE.
+NVK_NVGPU_ZCULL=0 disables it.
+
+Bind a correctly sized ZCULL context-switch buffer per 3D channel. The
+old bind passed the mode constant (2) as the ioctl request number, so it
+returned 0 without reaching nvgpu, and no buffer was ever bound.
+
+Occluded-draw rejection on Orin Nano (vkperf depth-reject, 2560x1440 D32)
+goes from 14.0 to 120.6 GPix/s. The NVIDIA blob reaches 196.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      | 34 +++++++++++++------
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c     | 34 +++++++++++++++++++
+ 2 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index a29ecbc5829..448abd818df 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -78,9 +78,18 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+    if (err != VK_SUCCESS)
+    	return err;
+ 
+-   err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj, 0x100000,  0x10000, NVKMD_MEM_VRAM, NVKMD_MEM_MAP_RDWR,  &ctx->zcull_buf); // xx how large? nvidia aligns to 0x1000
+-   if (err != VK_SUCCESS)
+-   	return err;
++   /* ZCULL context switch buffer, sized as nvgpu asks (ZCULL_GET_CTX_SIZE). */
++   const struct nv_device_info *dev_info = &_dev->pdev->dev_info;
++   const bool bind_zcull = (engines & NVKMD_ENGINE_3D) && dev_info->has_zcull_info;
++   if (bind_zcull) {
++      err = nvkmd_dev_alloc_mapped_mem(_dev, log_obj,
++                                       align64(dev_info->zcull_info.ctxsw_size, 0x1000),
++                                       dev_info->zcull_info.ctxsw_align,
++                                       NVKMD_MEM_VRAM, NVKMD_MEM_MAP_RDWR,
++                                       &ctx->zcull_buf);
++      if (err != VK_SUCCESS)
++         return err;
++   }
+ 
+    /* nvgpu's job post-fence is only "WFI + syncpoint increment": unlike the
+     * nouveau kernel fence, nothing writes dirty GPU L2 lines back to memory,
+@@ -241,13 +250,18 @@ nvkmd_nvgpu_create_exec_ctx(struct nvkmd_dev *_dev,
+    //    // .
+    // };
+ 
+-   struct nvgpu_zcull_bind_args zcull_bind_args = {
+-      .gpu_va = ctx->zcull_buf->va->addr,
+-      .mode =  NVGPU_ZCULL_MODE_SEPARATE_BUFFER,
+-   };
+-   if (ioctl(ctx->channel_fd, NVGPU_ZCULL_MODE_SEPARATE_BUFFER, &zcull_bind_args) == -1) {
+-      printf("failed to NVGPU_IOCTL_CHANNEL_ZCULL_BIND: %d\n", errno);
+-      return VK_ERROR_UNKNOWN;
++   /* This used to pass the mode constant (2) as the ioctl request: the call
++    * "succeeded" without reaching nvgpu, so no ZCULL buffer was ever bound.
++    */
++   if (bind_zcull) {
++      struct nvgpu_zcull_bind_args zcull_bind_args = {
++         .gpu_va = ctx->zcull_buf->va->addr,
++         .mode = NVGPU_ZCULL_MODE_SEPARATE_BUFFER,
++      };
++      if (ioctl(ctx->channel_fd, NVGPU_IOCTL_CHANNEL_ZCULL_BIND, &zcull_bind_args) == -1) {
++         printf("failed to NVGPU_IOCTL_CHANNEL_ZCULL_BIND: %d\n", errno);
++         return VK_ERROR_UNKNOWN;
++      }
+    }
+ 
+    // struct nvgpu_as_bind_channel_args bind_args;
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index e330ca0d458..ef9a7a275f6 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -9,6 +9,8 @@
+ #include "nvkmd/nvkmd.h"
+ #include "util/os_misc.h"
+ #include "util/cache_ops.h"
++#include "util/log.h"
++#include "util/u_debug.h"
+ #include "vk_log.h"
+ 
+ #include <fcntl.h>
+@@ -295,6 +297,38 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+ 
+    nouveau_ws_init_shared_mem_sizes(&pdev->base.dev_info);
+ 
++   /* ZCULL: NVK only uses it with has_zcull_info, which only the nouveau
++    * winsys used to set, so ZCULL was off on nvgpu (hidden pixels rejected
++    * per pixel instead of per tile).  nvgpu reports the same geometry.
++    * The context switch buffer is bound per channel (nvkmd_nvgpu_ctx.c).
++    */
++   struct nvgpu_gpu_zcull_get_info_args zinfo = { 0 };
++   struct nvgpu_gpu_zcull_get_ctx_size_args zsize = { 0 };
++   if (debug_get_bool_option("NVK_NVGPU_ZCULL", true) &&
++       ioctl(pdev->ctrl_fd, NVGPU_GPU_IOCTL_ZCULL_GET_INFO, &zinfo) == 0 &&
++       ioctl(pdev->ctrl_fd, NVGPU_GPU_IOCTL_ZCULL_GET_CTX_SIZE, &zsize) == 0 &&
++       zsize.size != 0 && zinfo.aliquot_total != 0) {
++      pdev->base.dev_info.zcull_info = (struct nv_zcull_device_info) {
++         .width_align_pixels = zinfo.width_align_pixels,
++         .height_align_pixels = zinfo.height_align_pixels,
++         .pixel_squares_by_aliquots = zinfo.pixel_squares_by_aliquots,
++         .aliquot_total = zinfo.aliquot_total,
++         .zcull_region_byte_multiplier = zinfo.region_byte_multiplier,
++         .zcull_region_header_size = zinfo.region_header_size,
++         .zcull_subregion_header_size = zinfo.subregion_header_size,
++         .subregion_count = zinfo.subregion_count,
++         .subregion_width_align_pixels = zinfo.subregion_width_align_pixels,
++         .subregion_height_align_pixels = zinfo.subregion_height_align_pixels,
++         .ctxsw_size = zsize.size,
++         .ctxsw_align = 4096,
++      };
++      pdev->base.dev_info.has_zcull_info = true;
++   }
++   mesa_logi("nvk/nvgpu: zcull %s (ctx %u B, aliquots %u, subregions %u, align %ux%u)",
++             pdev->base.dev_info.has_zcull_info ? "on" : "off", zsize.size,
++             zinfo.aliquot_total, zinfo.subregion_count,
++             zinfo.width_align_pixels, zinfo.height_align_pixels);
++
+    strncpy(pdev->base.dev_info.chipset_name, (const char*)&chars.chipname[0], sizeof(pdev->base.dev_info.chipset_name));
+ 
+ 
+-- 
+2.56.1
+

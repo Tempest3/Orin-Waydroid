@@ -1,0 +1,39 @@
+From b7e8f87b804759246d998bb54ea8417cfbc32aa3 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 01:44:26 -0500
+Subject: [PATCH] nvkmd/nvgpu: sub-allocated compression off by default
+
+It cost ~1% in 3DMark Wild Life Extreme (1914/1903 vs 1929/1932 with it
+off on the same build). Keep it available with
+NVK_NVGPU_COMPRESSION_SUBALLOC=1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+index 4a5c53b0f70..2a2e9e3617c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_pdev.c
+@@ -347,12 +347,14 @@ nvkmd_nvgpu_try_create_pdev(struct _drmDevice *drm_device,
+                          debug_get_bool_option("NVK_NVGPU_COMPRESSION", true),
+    };
+    /* Everything is sysmem, so compressing sub-allocated images has none of
+-    * nouveau's VRAM-pinning concerns.  NVK_NVGPU_COMPRESSION_SUBALLOC=0
+-    * limits compression to dedicated allocations (upstream behaviour).
++    * nouveau's VRAM-pinning concerns.  Off by default: it doubles blend and
++    * depth-write throughput in microbenchmarks, but compressing every
++    * render target of 3DMark Wild Life Extreme (4K, sub-allocated) cost ~1%
++    * (1909 vs 1931).  NVK_NVGPU_COMPRESSION_SUBALLOC=1 enables it.
+     */
+    pdev->base.kmd_info.has_compression_suballoc =
+       pdev->base.kmd_info.has_compression &&
+-      debug_get_bool_option("NVK_NVGPU_COMPRESSION_SUBALLOC", true);
++      debug_get_bool_option("NVK_NVGPU_COMPRESSION_SUBALLOC", false);
+ 
+    // XXX is this correct?
+    uint64_t os_page_size;
+-- 
+2.56.1
+

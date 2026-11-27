@@ -1,0 +1,183 @@
+From c95b8bcdea8ca4b7d0df14e3d465871ada403254 Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 15:19:03 -0500
+Subject: [PATCH] nak/sm70: set operand-reuse flags; keep-issuing (yield) bit
+ opt-in
+
+NAK never set the operand-reuse flags and left control bit 109 clear on
+every ordinary instruction.  The blob marks a GPR read by consecutive ALU
+instructions in the same operand slot with .reuse, and never emits a 1-cycle
+stall with bit 109 clear (clear = switch warps).
+
+Encoder changes (sm < 120 only):
+- record the single 32-bit GPR read by operand slots A/B/C while encoding;
+  set reuse on instruction N for slot k when N+1 is in the same straight-line
+  run (no block start/label between), both are fixed-latency, N is
+  unpredicated and doesn't write that GPR, and N+1 waits on no scoreboard.
+  On by default; NAK_NO_REUSE=1 disables it.
+- NAK_YIELD=1 (opt-in): set bit 109 by the blob's rule, learned from its SASS
+  of two WLE fragment shaders (96 % match over 2904 instrs): stall <= 2 or
+  any variable-latency/control op, never texture ops or NOPs.  NAK_YIELD=s1:
+  stall <= 1 only.
+
+Orin Nano (ga10b, 918 MHz).  vkperf GFLOP/s:   0031  reuse  +yield  blob
+  alu2x4 (128 FFMA straight line)              1230   1230   1762   1820
+  alu2   (32 FFMA loop)                        1171   1171   1516   1704
+  (yield without reuse: alu2x4 1210 - back-to-back issue exposes bank
+  conflicts that warp switching hid.)
+WLE deferred FS (shrun, ms/draw):              0031  reuse  +yield
+  0xfa9736617bb5                               3.624  3.585  3.70
+  0x5504e5e77dd0                               2.307  2.289  2.40
+With the blob rule (NAK_YIELD=1) the WLE FS are still 2.3-5.6 % slower than
+without (e.g. 0x5504 2.295 -> 2.424 ms), while ALU streams keep the gain:
+the bit pattern alone doesn't transfer, the blob's schedule is presumably
+built around it.  So reuse is on by default and yield stays opt-in.
+Memory-bound vkperf tests unchanged; zcheck/scheck/vkl2stale pass.
+---
+ src/nouveau/compiler/nak/sm70_encode.rs | 103 ++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
+diff --git a/src/nouveau/compiler/nak/sm70_encode.rs b/src/nouveau/compiler/nak/sm70_encode.rs
+index f5451b6c50e..9b94b8fc480 100644
+--- a/src/nouveau/compiler/nak/sm70_encode.rs
++++ b/src/nouveau/compiler/nak/sm70_encode.rs
+@@ -24,6 +24,9 @@ struct SM70Encoder<'a> {
+     ip: usize,
+     labels: &'a FxHashMap<Label, usize>,
+     inst: [u32; 4],
++    /// Single 32-bit GPR read by each ALU operand slot (A, B, C), recorded
++    /// while encoding so encode_sm70_shader can set operand-reuse flags.
++    gpr_slots: [Option<u32>; 3],
+ }
+ 
+ impl BitViewable for SM70Encoder<'_> {
+@@ -520,6 +523,21 @@ impl SM70Encoder<'_> {
+         src_type: SM70SrcType,
+         reg: &ALURegRef,
+     ) {
++        if file == RegFile::GPR
++            && reg.reg.comps() == 1
++            && reg.reg.base_idx() != 255
++        {
++            let slot = match range.start {
++                24 => Some(0), // A
++                32 => Some(1), // B
++                64 => Some(2), // C
++                _ => None,
++            };
++            if let Some(slot) = slot {
++                self.gpr_slots[slot] = Some(reg.reg.base_idx());
++            }
++        }
++
+         match file {
+             RegFile::GPR => self.set_reg(range, reg.reg),
+             RegFile::UGPR => self.set_ureg(range.start, reg.reg),
+@@ -4904,19 +4922,104 @@ pub fn encode_sm70_shader(sm: &ShaderModel70, s: &Shader<'_>) -> Vec<u32> {
+         }
+     }
+ 
++    // Operand reuse: when two consecutive fixed-latency ALU instructions
++    // read the same GPR in the same operand slot, set the reuse flag on the
++    // first so the second reads it from the operand cache, not the register
++    // file (avoids register-bank conflicts, e.g. "ffma rX, rX, c[], r1" with
++    // rX and r1 in the same bank).  Only within a straight-line run (reset at
++    // block starts and labels), only if the first is unpredicated and does
++    // not write that GPR, and the second waits on no scoreboard.
++    // NAK_NO_REUSE=1 disables it.
++    let reuse =
++        sm.sm() < 120 && std::env::var_os("NAK_NO_REUSE").is_none();
++    // Opt-in for now: this simple rule wins on pure ALU streams but costs
++    // 2-4 % on texture-heavy WLE fragment shaders (shrun), so the blob's
++    // real rule is subtler.
++    // 0 = off, 1 = blob rule (below), 2 = stall <= 1 only (A/B).
++    let yield_mode = match std::env::var("NAK_YIELD").as_deref() {
++        _ if sm.sm() >= 120 => 0,
++        Ok("1") => 1,
++        Ok("s1") => 2,
++        _ => 0,
++    };
++
+     let mut encoded = Vec::new();
+     for b in &func.blocks {
++        let mut prev: Option<(usize, [Option<u32>; 3], &Instr)> = None;
+         for instr in &b.instrs {
++            if matches!(&instr.op, Op::Nop(op) if op.label.is_some()) {
++                prev = None;
++            }
+             let mut e = SM70Encoder {
+                 sm: sm.sm(),
+                 ip: encoded.len(),
+                 labels: &labels,
+                 inst: [0_u32; 4],
++                gpr_slots: [None; 3],
+             };
+             instr.op.encode(&mut e);
+             e.set_pred(&instr.pred);
+             e.set_instr_deps(&instr.deps);
++            let ip = encoded.len();
+             encoded.extend_from_slice(&e.inst[..]);
++            // Bit 109 set = keep issuing from this warp.  The blob never
++            // emits a 1-cycle stall with it clear (that gives up the issue
++            // slot after every instruction); it clears it only on some
++            // instructions that stall for 2+ cycles anyway.  It only pays off
++            // together with the reuse flags below: issuing back-to-back
++            // exposes register-bank conflicts that warp switching hid
++            // (vkperf alu2x4: 1230 -> yield only 1210, yield + reuse 1762
++            // GFLOP/s; blob 1820).  NAK_YIELD=1 enables it.
++            // Blob rule, from its SASS of two WLE fragment shaders (matches
++            // 96 % of 2904 instructions): set for stall <= 2 or any
++            // variable-latency/control op, never for texture ops (switch
++            // warps after issuing a fetch) or NOPs.
++            let keep = match yield_mode {
++                1 => {
++                    !matches!(
++                        instr.op,
++                        Op::Tex(_)
++                            | Op::Tld(_)
++                            | Op::Tld4(_)
++                            | Op::Tmml(_)
++                            | Op::Txd(_)
++                            | Op::Txq(_)
++                            | Op::Nop(_)
++                    ) && (instr.deps.delay <= 2
++                        || !instr.op.has_fixed_latency(sm.sm()))
++                }
++                2 => instr.deps.delay <= 1,
++                _ => false,
++            };
++            if keep {
++                encoded[ip + 3] |= 1 << (109 - 96);
++            }
++
++            let fixed = reuse && instr.op.has_fixed_latency(sm.sm());
++            if let (true, Some((pip, pslots, pinstr))) = (fixed, prev) {
++                if instr.deps.wt_bar_mask == 0 {
++                    for k in 0..3 {
++                        let (Some(r), Some(pr)) = (e.gpr_slots[k], pslots[k])
++                        else {
++                            continue;
++                        };
++                        let written = pinstr.dsts().iter().any(|d| {
++                            d.as_reg().is_some_and(|d| {
++                                d.file() == RegFile::GPR
++                                    && d.idx_range().contains(&r)
++                            })
++                        });
++                        if r == pr && !written {
++                            encoded[pip + 3] |= 1 << (122 - 96 + k);
++                        }
++                    }
++                }
++            }
++            prev = if fixed && instr.pred.is_true() {
++                Some((ip, e.gpr_slots, instr))
++            } else {
++                None
++            };
+         }
+     }
+     encoded
+-- 
+2.56.1
+
