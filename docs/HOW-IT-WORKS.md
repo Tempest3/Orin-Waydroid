@@ -50,7 +50,7 @@ same module set swapped in (so no NVIDIA initrd is redistributed).
 | 0023 | tolerate 3D views of single-layer 2D images (3DMark Wild Life Extreme aborted in NIL) |
 | 0024 | `NVMAP_IOC_FREE` takes the handle, not a pointer: every freed allocation leaked (gralloc grew until lmkd killed apps) |
 
-### Performance work (branch `performance`, not in a release yet)
+### Performance work (0.1.2)
 
 Measured on an Orin Nano at 25 W with a microbenchmark against NVIDIA's own Vulkan driver on the same board, and with
 3DMark Wild Life Extreme (WLE) in Waydroid. WLE: about 1830 → about 1930, all of it from ZCULL.
@@ -63,6 +63,7 @@ Measured on an Orin Nano at 25 W with a microbenchmark against NVIDIA's own Vulk
 | 0028 | `NVK_NVGPU_SHADER_UNCACHED=0` (`debug.mesa.nvk.nvgpu.shader.uncached=false`) maps the shader heap L2-cached, for measuring | default unchanged (uncached); no measurable WLE difference |
 | 0029 | report `HOST_TRANSFER` usage as non-optimal for compressible images, so Zink drops it and its render targets get compressed | Zink color targets compressed |
 | 0030, 0031 | compression for sub-allocated images (64K-aligned binds; plain buffers left unregistered so nvgpu allocates comptags lazily); **off by default** (0031), `NVK_NVGPU_COMPRESSION_SUBALLOC=1` enables it | −1 % in WLE when on |
+| 0032 | NAK (sm70+): set the operand-reuse flags (`NAK_NO_REUSE=1` disables); optional "keep issuing" scheduling bit by NVIDIA's rule (`NAK_YIELD=1`, off: +30–43 % on pure ALU loops but 2–6 % slower on WLE shaders) | heavy WLE fragment shaders ≈ 1 % faster; WLE unchanged (~1920) |
 
 Off switches: `NVK_NVGPU_ZCULL=0`, `NVK_NVGPU_COMPRESSION=0` (Android: `debug.mesa.nvk.nvgpu.zcull=false`, etc.).
 

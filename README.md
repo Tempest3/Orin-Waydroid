@@ -12,9 +12,7 @@ and Zink), using the stock JetPack driver stack and no proprietary Android blobs
 | Result | Play Store sign-in works; Unity game *The Tower*: 60 FPS (vsync-locked), GPU ≈ 30–50 % |
 
 > **Experimental.** NVK on nvgpu is an out-of-tree Mesa backend
-> ([MR 34914](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34914)) plus 25 patches of ours (31 in total).
-> **This is the `performance` branch:** Mesa patches 0025–0031 (ZCULL, compression, a NAK fix) on top of release
-> 0.1.1. There are no release tarballs for it; build it yourself (see below). Details: docs/HOW-IT-WORKS.md.
+> ([MR 34914](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34914)) plus 26 patches of ours (32 in total).
 > It is not a conformant Vulkan driver. Expect bugs; keep backups of anything important.
 
 ## Quick start (on the Jetson)
@@ -24,16 +22,16 @@ once) and a Google account.
 
 ```sh
 git clone https://github.com/Tempest3/Orin-Waydroid.git orin-waydroid && cd orin-waydroid
-REL=https://github.com/Tempest3/Orin-Waydroid/releases/download/v0.1.1
+REL=https://github.com/Tempest3/Orin-Waydroid/releases/download/v0.1.2
 sudo ./install.sh --from $REL   # checks the system, installs the Waydroid kernel as an extra boot entry
 sudo reboot                     # choose "waydroid kernel" in the boot menu
-cd orin-waydroid && sudo ./install.sh --from https://github.com/Tempest3/Orin-Waydroid/releases/download/v0.1.1
+cd orin-waydroid && sudo ./install.sh --from https://github.com/Tempest3/Orin-Waydroid/releases/download/v0.1.2
                                 # installs Waydroid + GAPPS images, enables the GPU
 waydroid show-full-ui        # as your normal user, in the desktop session
 ```
 
 The release tarballs are on the [releases page](https://github.com/Tempest3/Orin-Waydroid/releases)
-(latest: [v0.1.1](https://github.com/Tempest3/Orin-Waydroid/releases/tag/v0.1.1)). `install.sh` downloads them and
+(latest: [v0.1.2](https://github.com/Tempest3/Orin-Waydroid/releases/tag/v0.1.2)). `install.sh` downloads them and
 checks `SHA256SUMS`. To install offline, put the tarballs and `SHA256SUMS` in `./dist` and leave out `--from`.
 
 Then register for the Play Store (Google requires this for uncertified devices):
