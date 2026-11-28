@@ -1,0 +1,137 @@
+From aae2daf2787f43417d9b59952f76721b2f6afc8c Mon Sep 17 00:00:00 2001
+From: tempest3 <konrad_f22@hotmail.com>
+Date: Fri, 27 Nov 2026 19:33:00 -0500
+Subject: [PATCH] nvk/nvgpu: don't serialize CPU and GPU on syncpoint waits and
+ Android presents
+
+- wait_many: SYNCPOINT_WAIT returns EAGAIN on timeout, and nvgpu_ioctl()
+  retried EAGAIN forever, so status polls (timeout 0) blocked until the GPU
+  finished. Call ioctl directly, retry only EINTR, map EAGAIN/ETIMEDOUT to
+  VK_TIMEOUT.
+- timeout_ns is an absolute s64 deadline; UINT64_MAX (-1) counted as
+  already expired, so every infinite wait was a CPU busy-spin. Clamp to
+  INT64_MAX (also in exec_ctx_sync).
+- wait_many: honour VK_SYNC_WAIT_PENDING for binary syncs (initialized ==
+  signal submitted) instead of waiting for completion before every
+  sync_file export.
+- QueueSignalReleaseImageANDROID: on nvgpu (EGL is Zink, syncs export real
+  sync files) use the common implementation instead of nouveau's
+  QueueWaitIdle workaround, which blocked each present ~4.5 ms.
+
+The Tower (Waydroid, headless 120 Hz, default clocks): 52 -> 63 FPS;
+present 4.5 -> 0.6 ms; ~3000 spinning ioctls/s gone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/nouveau/vulkan/nvk_android.c              | 17 ++++++++++
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c      |  3 +-
+ .../vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c     | 33 +++++++++++++++++--
+ 3 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_android.c b/src/nouveau/vulkan/nvk_android.c
+index 671b838b886..1fc1b77c7af 100644
+--- a/src/nouveau/vulkan/nvk_android.c
++++ b/src/nouveau/vulkan/nvk_android.c
+@@ -13,6 +13,9 @@
+ 
+ #include "vk_device.h"
+ #include "vk_queue.h"
++#include "vk_drm_syncobj.h"
++#include "vk_physical_device.h"
++#include "vk_common_entrypoints.h"
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_QueueSignalReleaseImageANDROID(VkQueue _queue,
+@@ -24,6 +27,20 @@ nvk_QueueSignalReleaseImageANDROID(VkQueue _queue,
+    VK_FROM_HANDLE(vk_queue, queue, _queue);
+    struct vk_device *device = queue->base.device;
+ 
++   /* nvgpu backend (host1x syncpoint syncs, not DRM syncobjs): EGL is Zink on
++    * this Vulkan driver, which imports SYNC_FD, and our syncs export real
++    * sync files.  Return the fence instead of draining the queue: the
++    * QueueWaitIdle below blocked every present until the GPU finished the
++    * frame (~4.5 ms in The Tower), serializing CPU and GPU.
++    */
++   const struct vk_sync_type *sync_type =
++      device->physical->supported_sync_types[0];
++   if (sync_type != NULL && !vk_sync_type_is_drm_syncobj(sync_type))
++      return vk_common_QueueSignalReleaseImageANDROID(_queue,
++                                                      waitSemaphoreCount,
++                                                      pWaitSemaphores,
++                                                      image, pNativeFenceFd);
++
+    /* This is to workaround nouveau not supporting native_fence_fd cap. On
+     * Android, the platform SurfaceFlinger RenderEngine has required
+     * EGL_ANDROID_native_fence_sync to import the sync file presented along
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+index 448abd818df..e50e602cd6c 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_ctx.c
+@@ -568,7 +568,8 @@ nvkmd_nvgpu_exec_ctx_sync(struct nvkmd_ctx *_ctx,
+    if (res != VK_SUCCESS) { return res; }
+ 
+    struct drm_tegra_syncpoint_wait wait_arg = {
+-      .timeout_ns = -1,
++      /* Absolute deadline; -1 would count as already expired (EAGAIN). */
++      .timeout_ns = INT64_MAX,
+       .id = fence.id,
+       .threshold = fence.value, // +1?
+    };
+diff --git a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+index 9fef104934c..d5e79436abf 100644
+--- a/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
++++ b/src/nouveau/vulkan/nvkmd/nvgpu/nvkmd_nvgpu_sync.c
+@@ -134,6 +134,18 @@ nvkmd_nvgpu_sync_wait_many(struct vk_device *device,
+          continue; // no work is pending on this syncpoint. XXX this is not actually correct; things can trigger sync other than GPU work!
+       }
+ 
++      /* WAIT_PENDING only asks for the signal operation to have been
++       * submitted, and a binary sync is initialized exactly when its signal
++       * is submitted (nvkmd_nvgpu_exec_ctx_signal).  vk_semaphore/vk_fence
++       * do such a wait before every sync_file export, i.e. in every
++       * vkQueueSignalReleaseImageANDROID; waiting for GPU completion there
++       * blocked each present until the frame finished rendering.
++       * Timeline payloads keep the (correct but stricter) completion wait.
++       */
++      if ((wait_flags & VK_SYNC_WAIT_PENDING) &&
++          !(sobj->base.flags & VK_SYNC_IS_TIMELINE))
++         continue;
++
+       // if (sobj->base.flags & VK_SYNC_IS_TIMELINE && waits[i].wait_value <= sobj->local_offset) {
+       //    continue; // already finished??
+       // }
+@@ -155,12 +167,29 @@ nvkmd_nvgpu_sync_wait_many(struct vk_device *device,
+       if ((int32_t)(raw_cur - raw_target) >= 0)
+          continue; // already finished
+ 
++      /* timeout_ns is an absolute CLOCK_MONOTONIC deadline (s64).  The kernel
++       * (drm_timeout_abs_to_jiffies) treats any deadline not after "now" as
++       * expired, including UINT64_MAX seen as -1, so clamp "forever".
++       */
+       struct drm_tegra_syncpoint_wait wait_arg = {
+-         .timeout_ns = abs_timeout_ns,
++         .timeout_ns = (int64_t)MIN2(abs_timeout_ns, (uint64_t)INT64_MAX),
+          .id = sobj->syncpoint_id,
+          .threshold = raw_target,
+       };
+-      if (nvgpu_ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait_arg) == -1) {
++      /* Not nvgpu_ioctl(): it retries EAGAIN forever, but SYNCPOINT_WAIT
++       * returns EAGAIN when the timeout has expired.  With the -1 deadline
++       * above that made every wait a CPU busy-spin, and every status poll
++       * (vkGetFenceStatus, vkWaitForFences with timeout 0, vk_sync's WAIT_ANY
++       * loop) a blocking wait for GPU completion, which serialized the CPU
++       * and GPU in apps that poll before reusing frame resources.
++       */
++      int ret;
++      do {
++         ret = ioctl(pdev->render_fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait_arg);
++      } while (ret == -1 && errno == EINTR);
++      if (ret == -1) {
++         if (errno == EAGAIN || errno == ETIMEDOUT)
++            return VK_TIMEOUT;
+          printf("wait: failed to DRM_IOCTL_TEGRA_SYNCPOINT_WAIT: %d\n", errno);
+          return VK_ERROR_UNKNOWN;
+       }
+-- 
+2.56.1
+

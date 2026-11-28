@@ -58,5 +58,6 @@ Then restart the game. Multi-finger gestures (pinch-to-zoom) still don't work wi
 
 ## Measuring FPS
 `tests/android-fps.sh` (copy to `~/.local/share/waydroid/data/local/tmp/`, run with
-`sudo waydroid shell -- sh /data/local/tmp/android-fps.sh "<layer>" 20`; the layer is the app's `(BLAST)`
-entry in `dumpsys SurfaceFlinger --list`), then `tests/android-fps.py <output>` on any machine.
+`sudo waydroid shell -- sh /data/local/tmp/android-fps.sh 10 > trace.txt` while the app is in front: a 10 s
+atrace), then `tests/android-fps.py trace.txt [app]` on any machine (counts the app's frames; `app` is a substring
+of its package name). It doesn't query SurfaceFlinger, so it doesn't disturb what it measures.
