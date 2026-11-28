@@ -22,6 +22,10 @@ Waydroid suspends Android when no window is open. Open it (`waydroid show-full-u
 `sudo waydroid container unfreeze`.
 
 ## Networking (no internet in Android, no Google ID)
+- Android was online and suddenly isn't ("offline" in apps), while `ping` works on the host: check
+  `sudo journalctl | grep "hwcomposer.*signal"`. Seen once (0.1.3 testing): Waydroid's composer crashed, Android
+  restarted its graphics but its network service never recovered. Fix: `waydroid session stop`, then start
+  Android again. Cause not known yet; a report with `sudo waydroid logcat -d` output helps.
 - `ip -6 rule` must work on the host while running the Waydroid kernel (it fails on the stock kernel).
 - `sudo waydroid shell -- dumpsys connectivity | grep VALIDATED` should print a line.
 - Docker or a firewall with a `FORWARD DROP` policy can block Waydroid's NAT (`waydroid0`, 192.168.240.0/24).
